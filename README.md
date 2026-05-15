@@ -1,6 +1,6 @@
 
 <p align="center">
-  <img src="qsm_logo.png" alt="QSM Logo" width="180"/>
+  <img src="logo.png" alt="QSM Logo" width="180"/>
 </p>
 
 # QSM: Quantum Lua Programming Language
