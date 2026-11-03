@@ -1,0 +1,11 @@
+include LICENSE README.md QSM_LANGUAGE.md CHANGELOG.md requirements.txt logo.png
+recursive-include examples *.qsm
+recursive-include tests *.py
+include editors/vscode/LICENSE editors/vscode/README.md
+include editors/vscode/package.json editors/vscode/package-lock.json
+include editors/vscode/extension.js editors/vscode/diagnostics.js
+include editors/vscode/gate-help.json editors/vscode/language-configuration.json
+include editors/vscode/.vscodeignore editors/vscode/.vscode/launch.json
+recursive-include editors/vscode/snippets *.json
+recursive-include editors/vscode/syntaxes *.json
+recursive-include editors/vscode/test *.cjs

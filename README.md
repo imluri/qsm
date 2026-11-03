@@ -1,134 +1,158 @@
-
 <p align="center">
   <img src="logo.png" alt="QSM Logo" width="180"/>
 </p>
 
 # QSM: Quantum Lua Programming Language
 
+QSM is a Lua-inspired language for building and simulating quantum circuits with
+Qiskit. Write quantum instructions alongside classical expressions, loops and
+functions, then run the file from a terminal or VS Code.
 
-QSM is a Lua-inspired quantum programming language for building quantum circuits and algorithms with Qiskit. It features a simple, extensible syntax and supports both quantum and classical control flow.
+## Install
 
+Download Python packages and the VS Code extension from the
+[latest release](https://github.com/imluri/qsm/releases/latest).
+For a downloaded wheel, run `python -m pip install /path/to/qsm-0.2.0-py3-none-any.whl`.
 
+From the repository root:
 
-## Features
-- **Lua-inspired syntax** for easy quantum programming
-- **Qiskit integration** for quantum circuit and algorithm development
-- **Quantum instructions:**
-  - `qbit`, `creg`, `hadamard`/`h`, `x`, `y`, `z`, `s`, `t`, `cx`, `swap`, `mcz`, `measure`, `teleport`
-- **Classical control flow:** `if`, `while`, `for`, assignments, and print
-- **User-defined functions** and function calls
-- **Multi-controlled Z gate** (Grover's diffusion)
-- **Single-line comments** with `--`
-- **Multiline comments** with `--[[ ... ]]--`
-- **Extensible**: add new gates or syntax in `qsm/parser.py` and `qsm/compiler.py`
-- **Full language reference:** see [`QSM_LANGUAGE.md`](QSM_LANGUAGE.md)
-
-## Installation
-
-1. Download the latest release source code from the [Releases page](https://github.com/astrixity/qsm/releases) and extract it.
-2. Open a terminal in the extracted folder.
-3. Install dependencies:
-   ```sh
-   pip install -r requirements.txt
-   ```
-4. (Optional) Install qsm as a command-line tool:
-   ```sh
-   pip install .
-   ```
-
-## Usage
-
-Run a qsm script:
 ```sh
-qsm <script.qsm>
+python -m venv .venv
 ```
 
-Example:
-```sh
-qsm hello.qsm
+Activate the environment:
+
+```powershell
+# Windows PowerShell
+.\.venv\Scripts\Activate.ps1
 ```
 
+```sh
+# macOS / Linux
+source .venv/bin/activate
+```
 
-## Example: Grover's Algorithm with Functions and Loops
+Install QSM, Qiskit and the Aer simulator together:
+
+```sh
+python -m pip install -e .
+```
+
+`python -m pip install -r requirements.txt` installs the same package and
+dependencies. Use `python -m qsm` if the `qsm` command is not on your PATH.
+
+## First circuit
+
+Save this as `bell.qsm`:
 
 ```qsm
-qbit q[4]
-creg answer[4]
+qbit q[2]
+creg answer[2]
 
--- Create uniform superposition
-for i = 0, 3 do
-    hadamard q[i]
-end
-
--- Oracle marks |1010>
-function oracle()
-    for i = 0, 3 do
-        if i % 2 == 0 then
-            z q[i]
-        end
-    end
-end
-
-function diffusion(n)
-    for i = 0, n-1 do
-        hadamard q[i]
-        x q[i]
-    end
-    h q[n-1]
-    mcz q[0..n-2], q[n-1]
-    h q[n-1]
-    for i = 0, n-1 do
-        x q[i]
-        hadamard q[i]
-    end
-end
-
-diffusion(4)
-oracle()
-diffusion(4)
-
-measure q[0] -> answer[0]
-measure q[1] -> answer[1]
-measure q[2] -> answer[2]
-measure q[3] -> answer[3]
-print "Grover output: ", answer
+h q[0]
+cx q[0], q[1]
+measure q -> answer
+print "Bell state:", answer
 ```
 
-Output
+Run it:
 
+```sh
+qsm bell.qsm
+qsm bell.qsm --shots 1024 --seed 42 --no-draw
 ```
-$ qsm .\main.qsm
-[qsm] Multi-controlled Z with 3 controls not fully implemented
-[qsm] Multi-controlled Z with 3 controls not fully implemented
 
-[qsm] Quantum Circuit:
-     ┌───┐┌───┐┌───┐┌───┐┌───┐┌───┐┌───┐┌───┐┌───┐┌───┐┌───┐┌───┐┌───┐┌───┐┌───┐┌───┐┌─┐
-q_0: ┤ H ├┤ H ├┤ X ├┤ H ├┤ Z ├┤ H ├┤ X ├┤ H ├┤ Z ├┤ H ├┤ X ├┤ H ├┤ Z ├┤ H ├┤ X ├┤ H ├┤M├
-     ├───┤├───┤├───┤├───┤├───┤├───┤├───┤├───┤├───┤└───┘└┬─┬┘└───┘└───┘└───┘└───┘└───┘└╥┘
-q_1: ┤ H ├┤ H ├┤ X ├┤ X ├┤ H ├┤ H ├┤ X ├┤ X ├┤ H ├──────┤M├───────────────────────────╫─
-     ├───┤├───┤├───┤├───┤├───┤├───┤├───┤├───┤├───┤┌───┐ └╥┘  ┌─┐                      ║
-q_2: ┤ H ├┤ H ├┤ X ├┤ X ├┤ H ├┤ Z ├┤ H ├┤ X ├┤ X ├┤ H ├──╫───┤M├──────────────────────╫─
-     ├───┤├───┤├───┤├───┤├───┤├───┤├───┤├───┤├───┤└┬─┬┘  ║   └╥┘                      ║
-q_3: ┤ H ├┤ H ├┤ X ├┤ X ├┤ H ├┤ H ├┤ X ├┤ X ├┤ H ├─┤M├───╫────╫───────────────────────╫─
-     └───┘└───┘└───┘└───┘└───┘└───┘└───┘└───┘└───┘ └╥┘   ║    ║                       ║
-c: 4/═══════════════════════════════════════════════╩════╩════╩═══════════════════════╩═
-                                                    3    1    2                       0
-[qsm] Grover output:  1000
+A Bell pair produces `00` or `11`. Register output includes the bitstring and its
+integer value, for example `[qsm] Bell state: 11 (3)`. With multiple shots, QSM
+also prints the counts. Print expressions that reference measurements use the
+first shot; bitstrings put the highest-index bit on the left.
+
+## Language support
+
+- Single-qubit gates, controlled gates, rotations, multi-controlled X/Z, reset,
+  barriers, measurement and teleportation.
+- Angle expressions such as `cp(-pi / 2^k) q[i], q[j]`.
+- Whole-register and inclusive-range operands: `h q`, `x q[0..2]`.
+- Arithmetic, comparisons, `and`/`or`/`not`, `true`/`false`/`nil`, and math functions.
+- Nested `if`/`elseif`/`else`, `while`, and inclusive `for` loops with optional steps.
+- Functions with expression arguments, individual qubit arguments and return values.
+- Measurement feedback: `if answer[0] == 1 then ... end` builds a runtime conditional.
+- Source filenames and line numbers in error messages.
+- UTF-8 source files, including a UTF-8 byte order mark.
+
+See the [language reference](QSM_LANGUAGE.md) for syntax and supported boundaries.
+
+## Command-line tools
+
+```sh
+qsm examples/quantum_phase_estimation.qsm --check
+qsm examples/grovers_algorithm.qsm --shots 1024 --seed 42 --no-draw
+qsm examples/bell_state.qsm --qasm bell.qasm
+qsm --help
 ```
----
 
-For a full language reference, advanced examples, and extension guide, see [`QSM_LANGUAGE.md`](QSM_LANGUAGE.md).
+`--check` compiles without simulation. `--qasm PATH` exports OpenQASM 3 without
+simulation. `--debug` adds compilation details and full tracebacks.
 
----
+## Examples
 
-## Notes for Users
+| Example | What it demonstrates |
+| --- | --- |
+| [Bell state](examples/bell_state.qsm) | Entanglement and measurement |
+| [QFT round trip](examples/3-cubit_QFT.qsm) | Controlled phases; returns `101` |
+| [Grover search](examples/grovers_algorithm.qsm) | Amplifies the marked state `1010` |
+| [Phase estimation](examples/quantum_phase_estimation.qsm) | Estimates phase 1/2 as `100` |
+| [Teleportation](examples/quantum_teleportation.qsm) | Measurement feedback; Bob's verification bit is zero |
+| [Language features](examples/language_features.qsm) | Expressions, functions, descending loops and `elseif` |
 
-- qsm is designed for quantum programming with a familiar, Lua-like syntax.
-- Use quantum instructions (`qbit`, `hadamard`, `x`, `z`, `y`, `s`, `t`, `cx`, `swap`, `measure`, `teleport`) to build quantum circuits.
-- Classical control flow (`if`, `while`, `for`) is supported for structuring your quantum code.
-- Comments start with `--` for single-line, or use `--[[ ... ]]--` for multiline comments.
-- Not all Lua features are supported; focus is on quantum programming.
-- See the `examples/` directory (if available) for more sample scripts.
-- For advanced users: you can extend qsm by editing the parser and compiler in the `qsm/` directory.
+Grover search is probabilistic; it is expected to return `1010` most of the time.
 
-For more information, see the code examples and documentation in this repository.
+## VS Code
+
+The [QSM extension](editors/vscode/README.md) adds syntax highlighting, snippets,
+hover help, indentation, folding, run/check commands and compilation errors in
+Problems. Open `editors/vscode` in VS Code and press F5 to try it. Set
+`qsm.pythonPath` to your virtual environment's Python executable.
+
+To install it locally, run `npx @vscode/vsce package` from `editors/vscode`, then
+use **Extensions: Install from VSIX**. The extension is not published to the
+Marketplace.
+
+You can also install the prebuilt `qsm-language-0.2.0.vsix` attached to the release.
+
+## Python API
+
+```python
+from qsm.compiler import QsmCompiler
+
+compiler = QsmCompiler()
+circuit = compiler.compile('qbit q[2]\nh q[0]\ncx q[0], q[1]\nmeasure q')
+counts = compiler.run_simulation(shots=1024, seed=42, draw=False)
+qasm = compiler.export_qasm()
+```
+
+The original `qsmCompiler` class name remains supported. Reusing a compiler for a
+new source file clears the previous circuit and execution state.
+
+## Development
+
+```sh
+python -m pip install -e .
+python -m unittest discover -s tests -v
+```
+
+Editor tests:
+
+```sh
+cd editors/vscode
+npm ci
+npm test
+```
+
+Tests check expression/control-flow behavior, quantum gate matrices, simulation
+results for every example, measurement feedback, teleportation, the CLI, and the
+editor grammar. CI runs Python tests on Windows and Linux and editor tests on Linux.
+
+QSM implements its own small expression evaluator; it does not execute arbitrary
+Python statements. It is a circuit-building language, with the runtime feedback
+boundaries documented in the reference, rather than a complete Lua implementation.

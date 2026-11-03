@@ -1,0 +1,73 @@
+{
+  "name": "QSM",
+  "scopeName": "source.qsm",
+  "patterns": [
+    {
+      "name": "comment.block.qsm",
+      "begin": "--\\[\\[",
+      "end": "\\]\\](?:--)?"
+    },
+    {
+      "name": "comment.line.double-dash.qsm",
+      "match": "--.*$"
+    },
+    {
+      "name": "string.quoted.double.qsm",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.qsm",
+          "match": "\\\\."
+        }
+      ]
+    },
+    {
+      "name": "string.quoted.single.qsm",
+      "begin": "'",
+      "end": "'",
+      "patterns": [
+        {
+          "name": "constant.character.escape.qsm",
+          "match": "\\\\."
+        }
+      ]
+    },
+    {
+      "name": "keyword.control.qsm",
+      "match": "\\b(?:if|then|elseif|else|end|for|while|do|function|return)\\b"
+    },
+    {
+      "name": "storage.type.qsm",
+      "match": "\\b(?:qbit|creg)\\b"
+    },
+    {
+      "name": "support.function.quantum.qsm",
+      "match": "\\b(?:hadamard|teleport|barrier|cswap|reset|swap|sxdg|ccx|crx|cry|crz|mcx|mcz|rxx|ryy|rzz|sdg|tdg|ch|cp|cx|cy|cz|id|rx|ry|rz|sx|h|p|s|t|u|x|y|z|measure)\\b"
+    },
+    {
+      "name": "support.function.builtin.qsm",
+      "match": "\\b(?:print|sin|cos|tan|asin|acos|atan|sqrt|exp|log|ceil|floor|abs|min|max|round|int|float)\\b"
+    },
+    {
+      "name": "constant.language.qsm",
+      "match": "\\b(?:true|false|nil|pi|tau|e)\\b"
+    },
+    {
+      "name": "keyword.operator.word.qsm",
+      "match": "\\b(?:and|or|not)\\b"
+    },
+    {
+      "name": "constant.numeric.qsm",
+      "match": "(?<!\\w)(?:\\d+\\.(?!\\.)\\d*|\\.\\d+|\\d+)(?:[eE][+-]?\\d+)?(?!\\w)"
+    },
+    {
+      "name": "keyword.operator.qsm",
+      "match": "->|\\.\\.|~=|==|!=|<=|>=|\\*\\*|//|[+*/%^=<>-]"
+    },
+    {
+      "name": "entity.name.function.qsm",
+      "match": "\\b[A-Za-z_]\\w*(?=\\s*\\()"
+    }
+  ]
+}

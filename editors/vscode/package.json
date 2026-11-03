@@ -1,0 +1,97 @@
+{
+  "name": "qsm-language",
+  "displayName": "QSM Language",
+  "description": "QSM quantum language highlighting, snippets, hover help, diagnostics and run commands.",
+  "version": "0.2.0",
+  "publisher": "astrixity",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/imluri/qsm"
+  },
+  "main": "./extension.js",
+  "activationEvents": [
+    "onLanguage:qsm"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false
+    }
+  },
+  "scripts": {
+    "test": "node --test test/*.test.cjs"
+  },
+  "contributes": {
+    "languages": [
+      {
+        "id": "qsm",
+        "aliases": [
+          "QSM",
+          "qsm"
+        ],
+        "extensions": [
+          ".qsm"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "qsm",
+        "scopeName": "source.qsm",
+        "path": "./syntaxes/qsm.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "qsm",
+        "path": "./snippets/qsm.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "qsm.runFile",
+        "title": "QSM: Run File"
+      },
+      {
+        "command": "qsm.checkFile",
+        "title": "QSM: Check File"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "qsm.runFile",
+          "when": "resourceLangId == qsm",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "QSM",
+      "properties": {
+        "qsm.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "scope": "machine-overridable",
+          "description": "Python interpreter with QSM installed. Set an absolute path for a virtual environment."
+        },
+        "qsm.checkOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Compile QSM files after saving and show errors in Problems."
+        }
+      }
+    }
+  },
+  "devDependencies": {
+    "vscode-oniguruma": "^2.0.1",
+    "vscode-textmate": "^9.3.2"
+  }
+}

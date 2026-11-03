@@ -1,38 +1,22 @@
-
--- Quantum Phase Estimation Example (estimates phase of U = Z gate)
-qbit q[3]      -- counting qubits
-qbit target    -- target qubit
+-- Estimate the phase 1/2 of Z acting on its |1> eigenstate.
+qbit q[3], target
 creg result[3]
-
--- Initialize counting qubits in superposition
-for i = 0, 2 do
-    hadamard q[i]
-end
-
--- Prepare target in |1> (eigenstate of Z with eigenvalue -1, phase pi)
+h q
 x target
 
--- Apply controlled-U^{2^k} (here U = Z, so just controlled-Z)
-cz q[2], target
-cz q[1], target
-cz q[0], target
+-- Controlled powers Z^(2^i): the first is Z, the others are identity.
+for i = 0, 2 do
+    cp(pi * 2^i) q[i], target
+end
 
--- Inverse QFT on counting qubits
+-- Inverse quantum Fourier transform on the counting register.
 swap q[0], q[2]
-hadamard q[2]
-cx q[1], q[2]
-t q[2]
-tdg q[1]
-cx q[0], q[2]
-t q[2]
-tdg q[0]
-cx q[0], q[1]
-t q[1]
-hadamard q[1]
-hadamard q[0]
+for j = 0, 2 do
+    for m = 0, j-1 do
+        cp(-pi / 2^(j-m)) q[m], q[j]
+    end
+    h q[j]
+end
 
--- Measure counting qubits
-measure q[0] -> result[0]
-measure q[1] -> result[1]
-measure q[2] -> result[2]
-print "QPE output: ", result
+measure q -> result
+print "QPE output (expected 100, phase 4/8):", result

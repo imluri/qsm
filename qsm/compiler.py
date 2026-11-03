@@ -1,949 +1,544 @@
-from __future__ import annotations
-import sys
-# qsm/compiler.py
-"""
-Quantum Lua Compiler – rewritten for clarity and safety.
+"""Compile QSM into Qiskit circuits and simulate them with Qiskit Aer."""
 
-Public API
-----------
-QsmCompiler().compile(code)   # parse & build circuit
-QsmCompiler().get_circuit()   # returns qiskit.QuantumCircuit
-QsmCompiler().export_qasm()   # OpenQASM 3 string
-"""
+from __future__ import annotations
 
 import ast
-from typing import Dict, List, Any, Tuple
-from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
-try:
-    from qiskit_aer import Aer, AerSimulator
-except ImportError:
-    print("Error: Qiskit Aer is not installed. Run `pip install qiskit-aer`.")
-    exit(1)
+import math
+import operator
+import re
+import sys
+from dataclasses import dataclass
 
-from qiskit import transpile
-
-# Remove deprecated imports
-# from qiskit import execute  # This is deprecated
-# from qiskit.primitives import Sampler  # Use AerSampler instead
+from qiskit import ClassicalRegister, QuantumCircuit, QuantumRegister, qasm3, transpile
 
 from qsm.parser import (
-    qsmParser,
-    QBitDecl, CRegDecl,
-    Hadamard, XGate, YGate, ZGate, SGate, TGate,
-    CX, SwapGate, MCZGate, Measure, Teleport,
-    FunctionDef, FunctionCall
+    CRegDecl, CX, FunctionCall, FunctionDef, GATES, Gate, Hadamard, MCZGate,
+    Measure, QBitDecl, SGate, SwapGate, TGate, Teleport, XGate, YGate, ZGate,
+    parse_expression, qsmParser, split_arguments,
 )
 
-
-# --- safety knobs -----------------------------------------------------------
 MAX_QUBITS = 128
-MAX_CBITS  = 128
+MAX_CBITS = 128
+MAX_ITERATIONS = 100000
+MAX_CALL_DEPTH = 100
 
-# --------------------------------------------------------------------------- #
-# Helper AST nodes the parser produces (already defined in parser.py)        #
-# --------------------------------------------------------------------------- #
-# (re-exported here for type checkers)
+_BINARY = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+           ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv,
+           ast.Mod: operator.mod, ast.Pow: operator.pow}
+_COMPARE = {ast.Eq: operator.eq, ast.NotEq: operator.ne, ast.Lt: operator.lt,
+            ast.LtE: operator.le, ast.Gt: operator.gt, ast.GtE: operator.ge}
+_BUILTINS = {name: getattr(math, name) for name in
+             ("sin", "cos", "tan", "asin", "acos", "atan", "sqrt", "exp", "log", "ceil", "floor")}
+_BUILTINS.update(abs=abs, min=min, max=max, round=round, int=int, float=float)
 
-# --------------------------------------------------------------------------- #
-# Main compiler implementation                                               #
-# --------------------------------------------------------------------------- #
+
+@dataclass(frozen=True)
+class _QubitRef:
+    name: str
+
+
+class _Return(Exception):
+    def __init__(self, value):
+        self.value = value
+
+
 class qsmCompiler:
-    def _eval_condition(self, node: ast.expr) -> bool:
-        """Evaluate a condition expression."""
-        # Simple evaluation for basic comparisons
-        if isinstance(node, ast.Compare):
-            left = self._eval_expr(node.left)
-            if len(node.ops) == 1 and len(node.comparators) == 1:
-                op = node.ops[0]
-                right = self._eval_expr(node.comparators[0])
-                if isinstance(op, ast.Lt):
-                    return left < right
-                elif isinstance(op, ast.LtE):
-                    return left <= right
-                elif isinstance(op, ast.Gt):
-                    return left > right
-                elif isinstance(op, ast.GtE):
-                    return left >= right
-                elif isinstance(op, ast.Eq):
-                    return left == right
-                elif isinstance(op, ast.NotEq):
-                    return left != right
-        elif isinstance(node, ast.Constant):
-            return bool(node.value)
-        elif isinstance(node, ast.Name):
-            return bool(self.env.get(node.id, False))
-        raise SyntaxError(f"Unsupported condition: {type(node)}")
-    
-    """
-    Compile qsm source into a Qiskit QuantumCircuit.
-    """
-    def __init__(self, debug=False) -> None:
-        self.debug = debug  # Accept debug parameter
-        self.qubit_map: Dict[str, int] = {}
-        self.cbit_map : Dict[str, int] = {}
-        self.qreg: List[str] = []
-        self.creg: List[str] = []
-        self.qc: QuantumCircuit | None = None
+    """Build a circuit with compile(), then run_simulation() or export_qasm()."""
+
+    def __init__(self, debug=False):
+        self.debug = debug
         self.parser = qsmParser()
-        self.env: Dict[str, Any] = {}
-        self.deferred_prints: List[ast.AST] = []
+        self._reset()
+
+    def _reset(self):
+        self.qubit_map, self.cbit_map = {}, {}
+        self.qreg, self.creg = [], []
+        self._quantum_names, self._classical_names = set(), set()
+        self._default_bits = {}
+        self.qc = None
+        self.env = {"pi": math.pi, "tau": math.tau, "e": math.e}
         self.variables = {}
+        self.deferred_prints = []
         self.has_measurements = False
+        self._iterations = self._call_depth = self._dynamic_depth = 0
+        self.filename = "<qsm>"
+
+    def compile(self, code, filename="<qsm>"):
+        self._reset()
+        self.filename = filename
+        nodes = self.parser.parse(code, filename=filename)
+        self._allocate_registers(nodes)
+        registers = []
+        if self.qreg:
+            registers.append(QuantumRegister(len(self.qreg), "q"))
+        if self.creg:
+            registers.append(ClassicalRegister(len(self.creg), "c"))
+        self.qc = QuantumCircuit(*registers)
+        for node in nodes:
+            self._emit(node)
+        self._debug_print("Built {} qubits, {} classical bits, {} operations".format(
+            self.qc.num_qubits, self.qc.num_clbits, len(self.qc.data)))
+        return self.qc
 
     def _debug_print(self, message):
-        """Print debug message only if debug mode is enabled."""
         if self.debug:
-            print(f"[qsm:debug] {message}")
+            print("[qsm:debug] " + message)
 
-    def compile(self, code):
-        """Compile QSM source code to quantum circuit."""
-        self._debug_print("Starting compilation")
-        
-        # Parse the QSM code using the QSM parser
+    def _allocate_registers(self, nodes):
+        implicit = False
+
+        def walk(items, nested=False):
+            nonlocal implicit
+            for node in items:
+                if isinstance(node, (QBitDecl, CRegDecl)):
+                    try:
+                        self._allocate_declaration(node, nested)
+                    except (SyntaxError, ValueError) as exc:
+                        exc.qsm_location = "{}:{}".format(self.filename, node.lineno)
+                        raise
+                elif isinstance(node, Measure) and node.classical_target is None:
+                    implicit = True
+                if hasattr(node, "body"):
+                    walk(node.body, True)
+                if hasattr(node, "orelse"):
+                    walk(node.orelse, True)
+        walk(nodes)
+        if implicit:
+            if len(self.creg) + len(self.qreg) > MAX_CBITS:
+                raise ValueError("Implicit measurements exceed the classical bit limit")
+            for i, name in enumerate(self.qreg):
+                self._default_bits[name] = len(self.creg)
+                self.creg.append("__measure[{}]".format(i))
+
+    def _allocate_declaration(self, node, nested):
+        if nested:
+            raise SyntaxError("Declare registers at the top level")
+        quantum = isinstance(node, QBitDecl)
+        mapping = self.qubit_map if quantum else self.cbit_map
+        names = self.qreg if quantum else self.creg
+        bases = self._quantum_names if quantum else self._classical_names
+        other = self._classical_names if quantum else self._quantum_names
+        new_bases = {name.split("[")[0] for name in node.targets}
+        reserved = set(_BUILTINS) | set(GATES) | {"pi", "tau", "e"}
+        if new_bases & reserved or (quantum and "result" in new_bases):
+            raise ValueError("Register names cannot use reserved language names")
+        if new_bases & (bases | other) or len(set(node.targets)) != len(node.targets):
+            raise ValueError("Register names must be unique")
+        # A scalar and an array cannot share a base within one declaration.
+        if any(base in node.targets and any(n.startswith(base + "[") for n in node.targets)
+               for base in new_bases):
+            raise ValueError("A scalar and an array cannot share a name")
+        limit = MAX_QUBITS if quantum else MAX_CBITS
+        if len(names) + len(node.targets) > limit:
+            raise ValueError("At most {} {} bits are supported".format(limit, "quantum" if quantum else "classical"))
+        bases.update(new_bases)
+        for name in node.targets:
+            mapping[name] = len(names)
+            names.append(name)
+
+    def _emit(self, node):
         try:
-            ast_nodes = self.parser.parse(code)
-            self._debug_print(f"Parsed {len(ast_nodes)} AST nodes")
-        except Exception as e:
-            self._debug_print(f"Parser error: {e}")
+            self._dispatch(node)
+        except _Return:
             raise
-        
-        # First pass: discover all registers
-        self._debug_print("First pass: discovering registers")
-        self._allocate_registers(ast_nodes)
-        self._debug_print(f"Found qubits: {self.qreg}")
-        self._debug_print(f"Found cbits: {self.creg}")
-        
-        # Second pass: build the circuit
-        self._debug_print("Second pass: building circuit")
-        self._build_circuit()
-        
-        # Third pass: emit all operations
-        self._debug_print("Third pass: emitting operations")
-        for node in ast_nodes:
-            self._debug_print(f"Processing node: {type(node)}")
-            self._emit(node)
-        
-        self._debug_print(f"Circuit built with {self.qc.num_qubits} qubits, {self.qc.num_clbits} cbits")
-        self._debug_print(f"Has measurements: {self.has_measurements}")
-        self._debug_print(f"Deferred prints: {len(self.deferred_prints)}")
-        
-        return self.qc
+        except (SyntaxError, NameError, ValueError, TypeError, IndexError, ZeroDivisionError, RuntimeError) as exc:
+            if not getattr(exc, "qsm_location", None):
+                line = getattr(node, "lineno", 1)
+                exc.qsm_location = "{}:{}".format(self.filename, line)
+            raise
 
-    def run_simulation(self):
-        """Run the quantum circuit simulation and execute deferred prints."""
-        if self.qc is None:
-            raise RuntimeError("No circuit compiled yet")
-        
-        # Always print the circuit diagram first
-        print("[qsm] Quantum Circuit:")
-        try:
-            print(self.qc.draw(output='text'))
-        except Exception as e:
-            self._debug_print(f"Could not draw circuit: {e}")
-            print(f"Circuit has {self.qc.num_qubits} qubits and {self.qc.num_clbits} classical bits")
-        
-        # If no measurements and no prints, we're done after showing the circuit
-        if not self.has_measurements and not self.deferred_prints:
-            return
-            
-        if self.has_measurements:
-            try:
-                # Use AerSimulator for circuits with measurements
-                backend = AerSimulator()
-                transpiled_qc = transpile(self.qc, backend)
-                job = backend.run(transpiled_qc, shots=1)
-                result = job.result()
-                counts = result.get_counts()
-                
-                if counts:
-                    bitstring = list(counts.keys())[0]  # Get the measurement result
-                    classical_result = {}
-                    for i, bit in enumerate(reversed(bitstring)):
-                        classical_result[i] = int(bit)
-                    self.variables["result"] = classical_result
-                else:
-                    self.variables["result"] = {}
-                    
-            except Exception as e:
-                print(f"Error running simulation: {e}")
-                self.variables["result"] = {}
-        
-        # Execute any deferred print statements
-        self.execute_deferred_prints()
-
-    def run_simulation(self):
-        """Run the quantum circuit simulation and execute deferred prints."""
-        if self.qc is None:
-            raise RuntimeError("No circuit compiled yet")
-        
-        # Always print the circuit diagram first
-        print("[qsm] Quantum Circuit:")
-        try:
-            print(self.qc.draw(output='text'))
-        except Exception as e:
-            print(f"[qsm:debug] Could not draw circuit: {e}")
-            print(f"Circuit has {self.qc.num_qubits} qubits and {self.qc.num_clbits} classical bits")
-        
-        # If no measurements and no prints, we're done after showing the circuit
-        if not self.has_measurements and not self.deferred_prints:
-            return
-            
-        if self.has_measurements:
-            try:
-                # Use AerSimulator for circuits with measurements
-                backend = AerSimulator()
-                transpiled_qc = transpile(self.qc, backend)
-                job = backend.run(transpiled_qc, shots=1)
-                result = job.result()
-                counts = result.get_counts()
-                
-                if counts:
-                    bitstring = list(counts.keys())[0]  # Get the measurement result
-                    classical_result = {}
-                    for i, bit in enumerate(reversed(bitstring)):
-                        classical_result[i] = int(bit)
-                    self.variables["result"] = classical_result
-                else:
-                    self.variables["result"] = {}
-                    
-            except Exception as e:
-                print(f"Error running simulation: {e}")
-                self.variables["result"] = {}
-        
-        # Execute any deferred print statements
-        self.execute_deferred_prints()
-
-    def eval_print(self, node):
-        """Evaluate and execute print statements."""
-        if isinstance(node, ast.Call) and node.func.id == "print":
-            output = []
-            for arg in node.args:
-                if isinstance(arg, ast.Constant):
-                    output.append(str(arg.value))
-                elif isinstance(arg, ast.Subscript):
-                    varname = arg.value.id
-                    index = arg.slice.value
-                    val = self.variables.get(varname, {}).get(index, None)
-                    output.append(str(val))
-            print("".join(output))
-
-    def execute_deferred_prints(self) -> None:
-        """Execute deferred print statements and display measurement results."""
-        # Prepare execution environment with measurement results
-        exec_env = self.env.copy()
-        exec_env.update(globals())
-
-        # Gather measurement results from simulation (if any)
-        measurement_results = {}
-        if self.has_measurements and "result" in self.variables:
-            # Map measured bits to classical registers (e.g., answer[0], answer[1], ...)
-            result_dict = self.variables["result"]
-            for i, bit in result_dict.items():
-                measurement_results[f"result[{i}]"] = bit
-                measurement_results[i] = bit
-            measurement_results["result"] = result_dict
-
-        # Build classical register dicts (e.g., answer = {0: bit, ...})
-        reg_bases = set()
-        for cname in self.creg:
-            if '[' in cname and cname.endswith(']'):
-                base = cname[:cname.index('[')]
-                reg_bases.add(base)
-        for base in reg_bases:
-            reg_dict = {}
-            for cname in self.creg:
-                if cname.startswith(base + '[') and cname.endswith(']'):
-                    try:
-                        idx = int(cname[cname.index('[')+1:-1])
-                    except Exception:
-                        continue
-                    # Try both int and str keys
-                    val = measurement_results.get(cname, measurement_results.get(idx, None))
-                    if val is not None:
-                        reg_dict[idx] = val
-            if reg_dict:
-                exec_env[base] = reg_dict
-
-        # Print debug info if needed
-        self._debug_print(f"measurement_results: {measurement_results}")
-        self._debug_print(f"exec_env keys: {list(exec_env.keys())}")
-
-        # Actually print deferred print statements
-        for item in self.deferred_prints:
-            # Each item is (node, captured_env) or just node
-            if isinstance(item, tuple):
-                node, captured_env = item
-            else:
-                node, captured_env = item, None
-
-            # Only handle print(...) calls
-            if not (isinstance(node, ast.Expr) and
-                    isinstance(node.value, ast.Call) and
-                    isinstance(node.value.func, ast.Name) and
-                    node.value.func.id == 'print'):
-                continue
-
-            args = node.value.args
-            parts = []
-
-            # Use captured_env for loop variables if available
-            frame_locals = captured_env if captured_env is not None else {}
-            local_env = exec_env.copy()
-            local_env.update(frame_locals)
-
-            for arg in args:
-                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                    parts.append(arg.value)
-                elif isinstance(arg, ast.Subscript):
-                    # e.g., answer[0]
-                    if isinstance(arg.value, ast.Name):
-                        var_name = arg.value.id
-                        # Extract the index, which may be ast.Constant or ast.Name
-                        index = None
-                        if hasattr(arg.slice, 'value'):
-                            index = arg.slice.value
-                        elif hasattr(arg.slice, 'n'):
-                            index = arg.slice.n
-                        elif isinstance(arg.slice, ast.Name):
-                            idx_name = arg.slice.id
-                            if idx_name in frame_locals:
-                                index = frame_locals[idx_name]
-                            elif idx_name in local_env:
-                                index = local_env[idx_name]
-                            else:
-                                index = idx_name
-                        else:
-                            index = 0
-                        value = "?"
-                        if var_name in local_env and isinstance(local_env[var_name], dict):
-                            d = local_env[var_name]
-                            if index in d:
-                                value = d[index]
-                            elif str(index) in d:
-                                value = d[str(index)]
-                        else:
-                            key = f"{var_name}[{index}]"
-                            value = local_env.get(key, "?")
-                        parts.append(str(value))
-                    else:
-                        parts.append("?")
-                elif isinstance(arg, ast.Name):
-                    # e.g., answer
-                    var_name = arg.id
-                    if var_name in local_env:
-                        value = local_env[var_name]
-                        if isinstance(value, dict):
-                            # Output as bitstring, big-endian (MSB first)
-                            keys = [k for k in value.keys() if isinstance(k, int)]
-                            if keys:
-                                max_idx = max(keys)
-                                bit_values = [str(value.get(i, "?")) for i in range(max_idx + 1)]
-                                bitstring = "".join(bit_values[::-1])
-                                # Also show integer value if all bits are 0/1
-                                if all(b in ("0", "1") for b in bit_values):
-                                    intval = int(bitstring, 2)
-                                    parts.append(f"{bitstring} ({intval})")
-                                else:
-                                    parts.append(bitstring)
-                            else:
-                                # Fallback: join all values
-                                parts.append("".join(str(v) for v in value.values()))
-                        else:
-                            parts.append(str(value))
-                    else:
-                        parts.append("?")
-                else:
-                    # Try to evaluate as a general expression
-                    try:
-                        wrapper = ast.Module(
-                            body=[ast.Assign(
-                                targets=[ast.Name(id="__tmp", ctx=ast.Store())],
-                                value=arg)],
-                            type_ignores=[])
-                        ast.fix_missing_locations(wrapper)
-                        exec(compile(wrapper, "<qsm_print>", "exec"), local_env)
-                        parts.append(str(local_env["__tmp"]))
-                    except Exception as e:
-                        self._debug_print(f"Print arg eval error: {e}")
-                        parts.append("?")
-
-            print("[qsm]", " ".join(str(p) for p in parts))
-
-    def get_circuit(self) -> QuantumCircuit:
-        if self.qc is None:
-            raise RuntimeError("Nothing compiled yet; call .compile(code) first.")
-        return self.qc
-
-    def export_qasm(self) -> str:
-        return self.get_circuit().qasm()
-
-    # --------------------------------------------------------------------- #
-    # First pass – discover registers                                       #
-    # --------------------------------------------------------------------- #
-    def _allocate_registers(self, nodes: List[Any]) -> None:
-        """Walk the AST once to collect qubit and classical bit names."""
-        for node in nodes:
-            self._allocate_registers_recursive(node)
-
-    def _allocate_registers_recursive(self, node: Any) -> None:
-        """Recursively find register declarations in any AST node."""
-        if isinstance(node, QBitDecl):
-            for name in node.targets:
-                self._add_qubit(name)
-        elif isinstance(node, CRegDecl):
-            for name in node.targets:
-                self._add_cbit(name)
-        elif isinstance(node, (ast.For, ast.While, ast.If)):
-            # Recursively check nested structures
-            for stmt in node.body:
-                self._allocate_registers_recursive(stmt)
-            if isinstance(node, ast.If):
-                for stmt in node.orelse:
-                    self._allocate_registers_recursive(stmt)
-        elif isinstance(node, list):
-            for item in node:
-                self._allocate_registers_recursive(item)
-
-    def _add_qubit(self, name: str) -> None:
-        if name in self.qubit_map:
-            return
-        idx = len(self.qreg)
-        self.qreg.append(name)
-        self.qubit_map[name] = idx
-
-    def _add_cbit(self, name: str) -> None:
-        if name in self.cbit_map:
-            return
-        idx = len(self.creg)
-        self.creg.append(name)
-        self.cbit_map[name] = idx
-
-        if '[' in name:
-            base = name.split('[')[0]
-            if base not in self.cbit_map:
-                self.cbit_map[base] = None   # sentinel "whole register" key
-
-    # --------------------------------------------------------------------- #
-    # Second pass – build the circuit                                       #
-    # --------------------------------------------------------------------- #
-    def _build_circuit(self) -> None:
-        qr = QuantumRegister(len(self.qreg), name="q")
-        cr = ClassicalRegister(len(self.creg), name="c") if self.creg else None
-        if cr:
-            self.qc = QuantumCircuit(qr, cr)
-        else:
-            self.qc = QuantumCircuit(qr)
-
-    # --------------------------------------------------------------------- #
-    # Dispatcher                                                            #
-    # --------------------------------------------------------------------- #
-
-
-    def _emit(self, node: Any, in_control_flow: bool = False) -> None:
-        """Single dispatcher for all AST nodes."""
-        if isinstance(node, list):
-            for item in node:
-                self._emit(item, in_control_flow=in_control_flow)
-            return
-
-        # Print: always defer, but capture loop variable values if in control flow
-        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call) and \
-           hasattr(node.value.func, 'id') and node.value.func.id == 'print':
-            if in_control_flow:
-                # Capture a shallow copy of current env (loop vars)
-                captured_env = self.env.copy()
-                self.deferred_prints.append((node, captured_env))
-            else:
-                self.deferred_prints.append((node, None))
-            return
-
+    def _dispatch(self, node):
         if isinstance(node, (QBitDecl, CRegDecl)):
             return
-
-        # Quantum gates
-        if isinstance(node, Hadamard):
-            self.qc.h(self._q(node.target))
-        elif isinstance(node, XGate):
-            self.qc.x(self._q(node.target))
-        elif isinstance(node, YGate):
-            self.qc.y(self._q(node.target))
-        elif isinstance(node, ZGate):
-            self.qc.z(self._q(node.target))
-        elif isinstance(node, SGate):
-            self.qc.s(self._q(node.target))
-        elif isinstance(node, TGate):
-            self.qc.t(self._q(node.target))
+        single = {Hadamard: "h", XGate: "x", YGate: "y", ZGate: "z", SGate: "s", TGate: "t"}
+        if type(node) in single:
+            for q in self._expand_reference(node.target, quantum=True):
+                getattr(self.qc, single[type(node)])(self.qubit_map[q])
         elif isinstance(node, CX):
             self.qc.cx(self._q(node.ctrl), self._q(node.targ))
         elif isinstance(node, SwapGate):
             self.qc.swap(self._q(node.q1), self._q(node.q2))
         elif isinstance(node, MCZGate):
-            self._handle_mcz(node.controls, node.target)
+            self._multi_control("mcz", split_arguments(node.controls), node.target)
+        elif isinstance(node, Gate):
+            self._gate(node)
         elif isinstance(node, Measure):
-            if hasattr(node, 'classical_target') and node.classical_target:
-                self.qc.measure(self._q(node.target), self._c(node.classical_target))
+            qubits = self._expand_reference(node.target, True)
+            if node.classical_target is None:
+                cbits = [self._default_bits[q] for q in qubits]
             else:
-                # Default behavior: measure to same index
-                self.qc.measure(self._q(node.target), self._c(node.target))
+                cbits = [self.cbit_map[c] for c in self._expand_reference(node.classical_target, False)]
+            if len(qubits) != len(cbits):
+                raise ValueError("Measurement register sizes differ")
+            for q, c in zip(qubits, cbits):
+                self.qc.measure(self.qubit_map[q], c)
             self.has_measurements = True
         elif isinstance(node, Teleport):
-            self._teleport_stub(node.q1, node.q2, node.q3)
-
-        # Classical control flow
+            self._teleport(node)
         elif isinstance(node, FunctionDef):
+            if self._dynamic_depth:
+                raise SyntaxError("Function definitions cannot depend on measurements")
+            self._check_variable(node.name)
             self.env[node.name] = node
         elif isinstance(node, FunctionCall):
-            self._call_function(node)
+            self._call_function(node.name, [self._eval_expr(arg) for arg in node.args])
+        elif isinstance(node, ast.Assign):
+            if self._dynamic_depth:
+                raise SyntaxError("Assignments cannot depend on measurements")
+            self._check_variable(node.targets[0].id)
+            self.env[node.targets[0].id] = self._eval_expr(node.value)
+        elif isinstance(node, ast.Return):
+            if not self._call_depth:
+                raise SyntaxError("'return' is only valid inside a function")
+            if self._dynamic_depth:
+                raise SyntaxError("Function returns cannot depend on measurements")
+            raise _Return(self._eval_expr(node.value) if node.value else None)
         elif isinstance(node, ast.For):
-            self._execute_for_loop(node)
-        elif isinstance(node, ast.While):
-            self._execute_while_loop(node)
-        elif isinstance(node, ast.If):
-            self._execute_if_statement(node)
-        elif isinstance(node, (ast.Assign, ast.Expr)):
-            self._exec_py_node(node)
-        else:
+            bounds = [self._integer(self._eval_expr(a), "Loop bound") for a in node.iter.args]
+            start, stop = bounds[:2]
+            step = bounds[2] if len(bounds) == 3 else 1
+            if step == 0:
+                raise ValueError("For-loop step cannot be zero")
+            name = node.target.id
+            self._check_variable(name)
+            missing = object()
+            old = self.env.get(name, missing)
             try:
-                self._exec_py_node(node)
-            except:
-                raise SyntaxError(f"Unsupported node: {type(node)}")
-
-    def _execute_for_loop(self, node: ast.For) -> None:
-        """Execute a for loop, handling quantum operations inside."""
-        # Extract loop variable and range
-        if isinstance(node.target, ast.Name):
-            loop_var = node.target.id
-        else:
-            raise SyntaxError("Only simple loop variables supported")
-        if isinstance(node.iter, ast.Call) and isinstance(node.iter.func, ast.Name) and node.iter.func.id == 'range':
+                for value in range(start, stop + (1 if step > 0 else -1), step):
+                    self._tick()
+                    self.env[name] = value
+                    for child in node.body:
+                        self._emit(child)
+            finally:
+                if old is missing:
+                    self.env.pop(name, None)
+                else:
+                    self.env[name] = old
+        elif isinstance(node, ast.While):
+            if self._uses_classical(node.test):
+                raise SyntaxError("While-loop conditions must be known at compile time")
+            while self._eval_expr(node.test):
+                self._tick()
+                for child in node.body:
+                    self._emit(child)
+        elif isinstance(node, ast.If):
+            self._if(node)
+        elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call) and node.value.func.id == "print":
+            if self._dynamic_depth:
+                raise SyntaxError("Print statements cannot depend on measurements; print after the conditional")
             args = []
-            for arg in node.iter.args:
-                if isinstance(arg, ast.Constant):
-                    args.append(arg.value)
-                elif isinstance(arg, ast.Name):
-                    args.append(self.env.get(arg.id, 0))
-                elif isinstance(arg, ast.BinOp):
-                    args.append(self._eval_expr(arg))
-                else:
-                    raise SyntaxError(f"Unsupported range argument: {type(arg)}")
-            if len(args) == 1:
-                range_obj = range(args[0])
-            elif len(args) == 2:
-                range_obj = range(args[0], args[1])
-            elif len(args) == 3:
-                range_obj = range(args[0], args[1], args[2])
-            else:
-                raise SyntaxError("Invalid range arguments")
-            for i in range_obj:
-                old_val = self.env.get(loop_var)
-                self.env[loop_var] = i
-                try:
-                    for stmt in node.body:
-                        self._emit(stmt, in_control_flow=True)
-                finally:
-                    if old_val is not None:
-                        self.env[loop_var] = old_val
-                    elif loop_var in self.env:
-                        del self.env[loop_var]
+            for arg in node.value.args:
+                # Freeze ordinary expressions now; measurement expressions use the final sample.
+                args.append(arg if self._uses_classical(arg) else ast.Constant(value=self._eval_expr(arg)))
+            self.deferred_prints.append((args, self.env.copy()))
         else:
-            raise SyntaxError("Only range() iteration supported")
+            raise SyntaxError("Unsupported statement: " + type(node).__name__)
 
-    def _execute_while_loop(self, node: ast.While) -> None:
-        while self._eval_condition(node.test):
-            for stmt in node.body:
-                self._emit(stmt, in_control_flow=True)
+    def _check_variable(self, name):
+        if name in self._quantum_names | self._classical_names or name == "result":
+            raise ValueError("'{}' is reserved for a register or measurement results".format(name))
+        if name in GATES or name in _BUILTINS or name in ("pi", "tau", "e", "print"):
+            raise ValueError("'{}' is a reserved language name".format(name))
 
-    def _execute_if_statement(self, node: ast.If) -> None:
-        if self._eval_condition(node.test):
-            for stmt in node.body:
-                self._emit(stmt, in_control_flow=True)
+    def _tick(self):
+        self._iterations += 1
+        if self._iterations > MAX_ITERATIONS:
+            raise RuntimeError("Compile-time loop iteration limit exceeded")
+
+    def _gate(self, node):
+        if node.name in ("mcx", "mcz"):
+            self._multi_control(node.name, node.targets[:-1], node.targets[-1])
+            return
+        params = [self._eval_expr(p) for p in node.params]
+        if any(isinstance(p, bool) or not isinstance(p, (int, float)) or not math.isfinite(p) for p in params):
+            raise ValueError("Gate angles must be finite numbers")
+        targets = [self.qubit_map[q] for target in node.targets for q in self._expand_reference(target, True)]
+        if node.name == "barrier":
+            self.qc.barrier(*(targets or range(self.qc.num_qubits)))
+        elif GATES[node.name][1] is None:
+            for target in targets:
+                getattr(self.qc, node.name)(*params, target)
         else:
-            for stmt in node.orelse:
-                self._emit(stmt, in_control_flow=True)
+            if len(targets) != GATES[node.name][1]:
+                raise ValueError("Gate '{}' requires individual qubits".format(node.name))
+            getattr(self.qc, node.name)(*params, *targets)
 
-    def _execute_print_now(self, node):
-        # Reuse the print logic from execute_deferred_prints, but with current env
-        args = node.value.args
-        parts = []
-        import inspect
-        frame_locals = self.env.copy()  # Use self.env for loop vars
-        exec_env = self.env.copy()
-        exec_env.update(globals())
-        for arg in args:
-            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                parts.append(arg.value)
-            elif isinstance(arg, ast.Subscript):
-                if isinstance(arg.value, ast.Name):
-                    var_name = arg.value.id
-                    index = None
-                    if hasattr(arg.slice, 'value'):
-                        index = arg.slice.value
-                    elif hasattr(arg.slice, 'n'):
-                        index = arg.slice.n
-                    elif isinstance(arg.slice, ast.Name):
-                        idx_name = arg.slice.id
-                        if idx_name in frame_locals:
-                            index = frame_locals[idx_name]
-                        elif idx_name in exec_env:
-                            index = exec_env[idx_name]
-                        else:
-                            index = idx_name
-                    else:
-                        index = 0
-                    value = "?"
-                    if var_name in exec_env and isinstance(exec_env[var_name], dict):
-                        d = exec_env[var_name]
-                        if index in d:
-                            value = d[index]
-                        elif str(index) in d:
-                            value = d[str(index)]
-                    else:
-                        key = f"{var_name}[{index}]"
-                        value = exec_env.get(key, "?")
-                    parts.append(str(value))
-                else:
-                    parts.append("?")
-            elif isinstance(arg, ast.Name):
-                var_name = arg.id
-                if var_name in exec_env:
-                    value = exec_env[var_name]
-                    if isinstance(value, dict):
-                        keys = [k for k in value.keys() if isinstance(k, int)]
-                        if keys:
-                            max_idx = max(keys)
-                            bit_values = [str(value.get(i, "?")) for i in range(max_idx + 1)]
-                            bitstring = "".join(bit_values[::-1])
-        for item in self.deferred_prints:
-            # Each item is (node, captured_env)
-            if isinstance(item, tuple):
-                node, captured_env = item
+    def _multi_control(self, name, controls, target):
+        controls = [self.qubit_map[q] for ref in controls for q in self._expand_reference(ref, True)]
+        target = self._q(target)
+        if len(set(controls + [target])) != len(controls) + 1:
+            raise ValueError("Controls and target must be distinct qubits")
+        if name == "mcz":
+            self.qc.h(target)
+        if controls:
+            self.qc.mcx(controls, target)
+        else:
+            self.qc.x(target)
+        if name == "mcz":
+            self.qc.h(target)
+
+    @staticmethod
+    def _integer(value, label):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(label + " must be an integer")
+        return value
+
+    def _expand_reference(self, reference, quantum):
+        mapping = self.qubit_map if quantum else self.cbit_map
+        names = self.qreg if quantum else list(self.cbit_map)
+        reference = reference.strip()
+        alias = self.env.get(reference)
+        if quantum and isinstance(alias, _QubitRef):
+            reference = alias.name
+        if reference in mapping:
+            return [reference]
+        match = re.fullmatch(r"([A-Za-z_]\w*)\[\s*(.+)\s*\]", reference)
+        if match:
+            base, index = match.groups()
+            if ".." in index:
+                start, stop = index.split("..", 1)
+                start, stop = self._eval_expr_str(start), self._eval_expr_str(stop)
+                if stop - start + 1 > len(mapping):
+                    raise NameError("Register range '{}' exceeds the declared register".format(reference))
+                resolved = ["{}[{}]".format(base, i) for i in range(start, stop + 1)]
             else:
-                node, captured_env = item, None
+                resolved = ["{}[{}]".format(base, self._eval_expr_str(index))]
+        else:
+            resolved = [name for name in names if name.startswith(reference + "[")]
+        if not resolved and match and ".." in match[2] and match[1] in (self._quantum_names if quantum else self._classical_names):
+            return []
+        if not resolved or any(name not in mapping for name in resolved):
+            raise NameError("{} '{}' is not declared or is out of range".format("Qubit" if quantum else "Classical bit", reference))
+        return resolved
 
-            # Skip anything that is not print(...)
-            if not (isinstance(node, ast.Expr) and
-                    isinstance(node.value, ast.Call) and
-                    isinstance(node.value.func, ast.Name) and
-                    node.value.func.id == 'print'):
-                continue
+    def _q(self, name):
+        resolved = self._expand_reference(name, True)
+        if len(resolved) != 1:
+            raise ValueError("Expected an individual qubit: " + name)
+        return self.qubit_map[resolved[0]]
 
-            args = node.value.args
-            parts = []
+    def _c(self, name):
+        resolved = self._expand_reference(name, False)
+        if len(resolved) != 1:
+            raise ValueError("Expected an individual classical bit: " + name)
+        return self.cbit_map[resolved[0]]
 
-            # Use captured_env for loop variables if available
-            frame_locals = captured_env if captured_env is not None else {}
-            exec_env = self.env.copy()
-            exec_env.update(globals())
-            exec_env.update(frame_locals)
+    def _eval_expr_str(self, source):
+        return self._integer(self._eval_expr(parse_expression(source)), "Register index")
 
-            for arg in args:
-                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                    parts.append(arg.value)
-
-                elif isinstance(arg, ast.Subscript):
-                    # Handle result[0], result[1], answer[i], etc.
-                    if isinstance(arg.value, ast.Name):
-                        var_name = arg.value.id
-                        # Extract the index, which may be ast.Constant or ast.Name
-                        index = None
-                        if hasattr(arg.slice, 'value'):
-                            index = arg.slice.value
-                        elif hasattr(arg.slice, 'n'):
-                            index = arg.slice.n
-                        elif isinstance(arg.slice, ast.Name):
-                            idx_name = arg.slice.id
-                            # Try to resolve idx_name from frame_locals, then exec_env
-                            if idx_name in frame_locals:
-                                index = frame_locals[idx_name]
-                            elif idx_name in exec_env:
-                                index = exec_env[idx_name]
-                            else:
-                                index = idx_name  # fallback to string
-                        else:
-                            index = 0  # fallback
-
-                        # Try both int and str keys
-                        value = "?"
-                        if var_name in exec_env and isinstance(exec_env[var_name], dict):
-                            d = exec_env[var_name]
-                            if index in d:
-                                value = d[index]
-                            elif str(index) in d:
-                                value = d[str(index)]
-                        else:
-                            key = f"{var_name}[{index}]"
-                            value = exec_env.get(key, "?")
-                        parts.append(str(value))
-                    else:
-                        parts.append("?")
-
-                elif isinstance(arg, ast.Name):
-                    # Handle variable names
-                    var_name = arg.id
-                    self._debug_print(f"print handler: var_name='{var_name}', in exec_env={var_name in exec_env}")
-                    if var_name in exec_env:
-                        value = exec_env[var_name]
-                        if isinstance(value, dict):
-                            # Output as bitstring, big-endian (MSB first)
-                            keys = [k for k in value.keys() if isinstance(k, int)]
-                            if keys:
-                                max_idx = max(keys)
-                                bit_values = [str(value.get(i, "?")) for i in range(max_idx + 1)]
-                                bitstring = "".join(bit_values[::-1])
-                                # Also show integer value if all bits are 0/1
-                                if all(b in ("0", "1") for b in bit_values):
-                                    intval = int(bitstring, 2)
-                                    parts.append(f"{bitstring} ({intval})")
-                                else:
-                                    parts.append(bitstring)
-                            else:
-                                # Fallback: join all values
-                                parts.append("".join(str(v) for v in value.values()))
-                        else:
-                            parts.append(str(value))
-                    else:
-                        parts.append("?")
-
-                else:
-                    # Try to evaluate as a general expression
-                    try:
-                        wrapper = ast.Module(
-                            body=[ast.Assign(
-                                targets=[ast.Name(id="__tmp", ctx=ast.Store())],
-                                value=arg)],
-                            type_ignores=[])
-                        ast.fix_missing_locations(wrapper)
-                        exec(compile(wrapper, "<qsm_print>", "exec"), exec_env)
-                        parts.append(str(exec_env["__tmp"]))
-                    except Exception as e:
-                        self._debug_print(f"Print arg eval error: {e}")
-                        parts.append("?")
-
-            print("[qsm]", " ".join(str(p) for p in parts))
-
-    def _eval_expr(self, node: ast.expr) -> Any:
-        """Evaluate an expression."""
+    def _eval_expr(self, node, env=None):
+        env = self.env if env is None else env
+        evaluate = lambda child: self._eval_expr(child, env)
         if isinstance(node, ast.Constant):
             return node.value
-        elif isinstance(node, ast.Name):
-            return self.env.get(node.id, 0)
-        elif isinstance(node, ast.BinOp):
-            left = self._eval_expr(node.left)
-            right = self._eval_expr(node.right)
-            if isinstance(node.op, ast.Add):
-                return left + right
-            elif isinstance(node.op, ast.Sub):
-                return left - right
-            elif isinstance(node.op, ast.Mult):
-                return left * right
-            elif isinstance(node.op, ast.Div):
-                return left / right
-            elif isinstance(node.op, ast.FloorDiv):
-                return left // right
-            elif isinstance(node.op, ast.Mod):
-                return left % right
-            elif isinstance(node.op, ast.Pow):
-                return left ** right
-            else:
-                raise SyntaxError(f"Unsupported binary operator: {type(node.op)}")
-        elif isinstance(node, ast.Subscript):
-            value = self._eval_expr(node.value)
-            # Python 3.9+: node.slice is ast.Constant; older: ast.Index
-            if hasattr(node.slice, 'value'):
-                idx = node.slice.value
-            else:
-                idx = self._eval_expr(node.slice)
-            # If value is a dict (like env), get by key; if list, by index
-            if isinstance(value, dict):
-                return value.get(f"{node.value.id}[{idx}]", 0)
-            elif isinstance(value, list):
-                return value[idx]
-            else:
-                return 0
-        raise SyntaxError(f"Unsupported expression: {type(node)}")
+        if isinstance(node, ast.Name):
+            if node.id in env:
+                return env[node.id]
+            if node.id in self.qubit_map:
+                return _QubitRef(node.id)
+            if node.id in self._classical_names or node.id == "result":
+                raise ValueError("Measurement values are available at runtime; use a bit comparison in 'if'")
+            raise NameError("Unknown variable '{}'".format(node.id))
+        if isinstance(node, ast.Subscript):
+            index = self._integer(evaluate(node.slice), "Register index")
+            if isinstance(node.value, ast.Name) and node.value.id in self._quantum_names:
+                name = "{}[{}]".format(node.value.id, index)
+                self._q(name)
+                return _QubitRef(name)
+            value = evaluate(node.value)
+            if not isinstance(value, dict) or index not in value:
+                raise IndexError("Register index {} is out of range".format(index))
+            return value[index]
+        if isinstance(node, ast.BinOp) and type(node.op) in _BINARY:
+            return _BINARY[type(node.op)](evaluate(node.left), evaluate(node.right))
+        if isinstance(node, ast.UnaryOp):
+            operations = {ast.USub: operator.neg, ast.UAdd: operator.pos, ast.Not: operator.not_}
+            if type(node.op) in operations:
+                return operations[type(node.op)](evaluate(node.operand))
+        if isinstance(node, ast.BoolOp):
+            value = evaluate(node.values[0])
+            for child in node.values[1:]:
+                if isinstance(node.op, ast.And) and not value or isinstance(node.op, ast.Or) and value:
+                    return value
+                value = evaluate(child)
+            return value
+        if isinstance(node, ast.Compare):
+            left = evaluate(node.left)
+            for operation, comparator in zip(node.ops, node.comparators):
+                if type(operation) not in _COMPARE:
+                    raise SyntaxError("Unsupported comparison")
+                right = evaluate(comparator)
+                if not _COMPARE[type(operation)](left, right):
+                    return False
+                left = right
+            return True
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and not node.keywords:
+            args = [evaluate(a) for a in node.args]
+            if node.func.id in _BUILTINS:
+                return _BUILTINS[node.func.id](*args)
+            if env is not self.env:
+                raise SyntaxError("User function calls in measurement-dependent print expressions are unsupported")
+            return self._call_function(node.func.id, args)
+        raise SyntaxError("Unsupported expression: " + type(node).__name__)
 
-    # --------------------------------------------------------------------- #
-    # Helpers                                                               #
-    # --------------------------------------------------------------------- #
-    def _q(self, name: str) -> int:
-        """Return the circuit index for qubit `name`."""
-        # Handle array notation like q[0], q[1], etc.
-        if '[' in name and name.endswith(']'):
-            # This is an array access, resolve it
-            base_name, index_str = name[:-1].split('[', 1)
-            try:
-                index = int(index_str)
-            except ValueError:
-                # Index might be a variable
-                index = self.env.get(index_str, 0)
-            final_name = f"{base_name}[{index}]"
-        else:
-            final_name = name
-            
-        if final_name not in self.qubit_map:
-            raise NameError(f"Qubit '{final_name}' not declared.")
-        return self.qubit_map[final_name]
-
-    def _c(self, name: str) -> int:
-        """Return the circuit index for classical bit `name`."""
-        # Handle array notation like answer[0], answer[1], etc.
-        if '[' in name and name.endswith(']'):
-            # This is an array access, resolve it
-            base_name, index_str = name[:-1].split('[', 1)
-            try:
-                index = int(index_str)
-            except ValueError:
-                # Index might be a variable
-                index = self.env.get(index_str, 0)
-            final_name = f"{base_name}[{index}]"
-        else:
-            final_name = name
-            
-        if final_name in self.cbit_map:
-            return self.cbit_map[final_name]
-        # If no creg with matching name exists, fall back to same index as qubit
-        return self._q(final_name)
-
-    # -------------------- classical execution (very small subset) ----------
-    def _exec_py_node(self, node: Any) -> None:
-        """Execute Python AST nodes (assignments, expressions, etc.)."""
-        # Fix AST nodes by adding required fields
-        self._fix_ast_node(node)
-        
-        # We cheat: compile to Python and exec in self.env
-        wrapper = ast.Module(body=[node], type_ignores=[])
-        ast.fix_missing_locations(wrapper)  # This adds lineno and col_offset
-        code = compile(wrapper, "<qsm>", "exec")
-        exec(code, self.env)   # nosec: safe because we only accept tiny subset
-
-    def _fix_ast_node(self, node: Any) -> None:
-        """Recursively fix AST nodes by adding required fields."""
-        if isinstance(node, ast.AST):
-            # Add lineno and col_offset if missing
-            if not hasattr(node, 'lineno'):
-                node.lineno = 1
-            if not hasattr(node, 'col_offset'):
-                node.col_offset = 0
-            
-            # Recursively fix child nodes
-            for field, value in ast.iter_fields(node):
-                if isinstance(value, list):
-                    for item in value:
-                        if isinstance(item, ast.AST):
-                            self._fix_ast_node(item)
-                elif isinstance(value, ast.AST):
-                    self._fix_ast_node(value)
-
-    def _call_function(self, call_node: FunctionCall) -> None:
-        func = self.env.get(call_node.name)
-        if not isinstance(func, FunctionDef):
-            raise NameError(f"Function '{call_node.name}' not defined.")
-        # Bind arguments into a fresh local env (very naive)
-        local_env = self.env.copy()
-        for arg_name, arg_expr in zip(func.args, call_node.args):
-            local_env[arg_name] = int(arg_expr)  # supports literals only
+    def _call_function(self, name, args):
+        function = self.env.get(name)
+        if not isinstance(function, FunctionDef):
+            raise NameError("Function '{}' is not defined".format(name))
+        if len(args) != len(function.args):
+            raise TypeError("Function '{}' expects {} arguments, received {}".format(name, len(function.args), len(args)))
+        for parameter, value in zip(function.args, args):
+            if parameter in self._quantum_names and isinstance(value, _QubitRef):
+                continue
+            self._check_variable(parameter)
+        if self._call_depth >= MAX_CALL_DEPTH:
+            raise RuntimeError("Function call depth limit exceeded")
         old_env = self.env
-        self.env = local_env
+        self.env = dict(old_env, **dict(zip(function.args, args)))
+        self._call_depth += 1
         try:
-            for stmt in func.body:
-                self._emit(stmt)
+            for child in function.body:
+                self._emit(child)
+        except _Return as result:
+            return result.value
         finally:
+            self._call_depth -= 1
             self.env = old_env
+        return None
 
-    def _handle_mcz(self, controls: str, target: str) -> None:
-        """Handle multi-controlled Z gate."""
-        # Parse controls (e.g., "q[0..n-2]" or "q[0],q[1],q[2]")
-        control_qubits = []
-        
-        if '..' in controls:
-            # Range notation like q[0..n-2]
-            base, range_part = controls.split('[', 1)
-            range_part = range_part.rstrip(']')
-            start_str, end_str = range_part.split('..', 1)
-            
-            # Evaluate expressions
-            start = self._eval_expr_str(start_str)
-            end = self._eval_expr_str(end_str)
-            
-            for i in range(start, end + 1):
-                control_qubits.append(self._q(f"{base}[{i}]"))
-        else:
-            # Individual qubits - handle comma-separated list
-            control_names = [c.strip() for c in controls.split(',')]
-            control_qubits = [self._q(name) for name in control_names]
-        
-        target_qubit = self._q(target)
-        # Remove target from controls if present (avoid duplicate qubit arguments)
-        control_qubits = [q for q in control_qubits if q != target_qubit]
+    def _uses_classical(self, node):
+        return any(isinstance(n, ast.Name) and
+                   (n.id in self._classical_names or n.id == "result") for n in ast.walk(node))
 
-        # Implement multi-controlled Z using Qiskit's mcz gate
-        if len(control_qubits) == 0:
-            # No controls, just apply Z gate
-            self.qc.z(target_qubit)
-        elif len(control_qubits) == 1:
-            # Single controlled Z
-            self.qc.cz(control_qubits[0], target_qubit)
-        else:
-            # Multi-controlled Z - use Qiskit's built-in method
-            # Note: mcz is available in newer Qiskit versions
+    def _runtime_bit(self, node):
+        if isinstance(node, ast.Name) and node.id in self.cbit_map:
+            return self.cbit_map[node.id]
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+            base = node.value.id
+            index = self._integer(self._eval_expr(node.slice), "Classical bit index")
+            if base == "result" and base not in self._classical_names:
+                if not 0 <= index < self.qc.num_clbits:
+                    raise IndexError("Result bit index is out of range")
+                return index
+            return self._c("{}[{}]".format(base, index))
+        raise SyntaxError("Measurement conditions require one classical bit")
+
+    def _if(self, node):
+        if not self._uses_classical(node.test):
+            for child in node.body if self._eval_expr(node.test) else node.orelse:
+                self._emit(child)
+            return
+        test = node.test
+        if not (isinstance(test, ast.Compare) and len(test.ops) == 1 and
+                isinstance(test.ops[0], (ast.Eq, ast.NotEq))):
+            raise SyntaxError("Use 'if classical_bit == 0/1 then' for measurement feedback")
+        left, right = test.left, test.comparators[0]
+        if not self._uses_classical(left):
+            left, right = right, left
+        bit = self._runtime_bit(left)
+        value = self._eval_expr(right)
+        if value not in (0, 1):
+            raise ValueError("Measurement conditions compare a bit with 0 or 1")
+        if isinstance(test.ops[0], ast.NotEq):
+            value = 1 - value
+        self._dynamic_depth += 1
+        try:
+            with self.qc.if_test((self.qc.clbits[bit], int(value))) as otherwise:
+                for child in node.body:
+                    self._emit(child)
+            if node.orelse:
+                with otherwise:
+                    for child in node.orelse:
+                        self._emit(child)
+        finally:
+            self._dynamic_depth -= 1
+
+    def _teleport(self, node):
+        if self._dynamic_depth:
+            raise SyntaxError("The teleport shorthand must be outside measurement conditionals")
+        q1, q2, q3 = self._q(node.q1), self._q(node.q2), self._q(node.q3)
+        if len({q1, q2, q3}) != 3:
+            raise ValueError("Teleportation requires three distinct qubits")
+        if self.qc.num_clbits + 2 > MAX_CBITS:
+            raise ValueError("Teleportation exceeds the classical bit limit")
+        # Named registers keep all memory bits visible in Aer counts and samples.
+        bits = ClassicalRegister(2, "teleport_{}".format(self.qc.num_clbits))
+        self.qc.add_register(bits)
+        self.qc.h(q2)
+        self.qc.cx(q2, q3)
+        self.qc.cx(q1, q2)
+        self.qc.h(q1)
+        self.qc.measure(q1, bits[0])
+        self.qc.measure(q2, bits[1])
+        with self.qc.if_test((bits[1], 1)):
+            self.qc.x(q3)
+        with self.qc.if_test((bits[0], 1)):
+            self.qc.z(q3)
+        self.has_measurements = True
+
+    def get_circuit(self):
+        if self.qc is None:
+            raise RuntimeError("Call compile() first")
+        return self.qc
+
+    def export_qasm(self):
+        return qasm3.dumps(self.get_circuit())
+
+    def run_simulation(self, shots=1, seed=None, draw=True):
+        circuit = self.get_circuit()
+        if isinstance(shots, bool) or not isinstance(shots, int) or shots < 1:
+            raise ValueError("Shots must be a positive integer")
+        if draw:
+            print("[qsm] Quantum Circuit:")
+            drawing = str(circuit.draw(output="text"))
+            encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+            print(drawing.encode(encoding, errors="replace").decode(encoding))
+        counts = {}
+        if self.has_measurements:
             try:
-                self.qc.mcz(control_qubits, target_qubit)
-            except AttributeError:
-                # Fallback: decompose into CNOT gates and single Z
-                # This is a simplified decomposition
-                for ctrl in control_qubits:
-                    self.qc.cx(ctrl, target_qubit)
-                self.qc.z(target_qubit)
-                for ctrl in reversed(control_qubits):
-                    self.qc.cx(ctrl, target_qubit)
+                from qiskit_aer import AerSimulator
+            except ImportError as exc:
+                raise RuntimeError("Simulation requires Qiskit Aer; install qsm with pip install .") from exc
+            backend = AerSimulator()
+            executable = transpile(circuit, backend, seed_transpiler=seed)
+            result = backend.run(executable, shots=shots, memory=True, seed_simulator=seed).result()
+            if not result.success:
+                raise RuntimeError("Simulation failed: " + str(result.status))
+            counts = result.get_counts()
+            sample = result.get_memory()[0].replace(" ", "")
+            self.variables["result"] = {i: int(bit) for i, bit in enumerate(reversed(sample))}
+        self.execute_deferred_prints()
+        return counts
 
-    def _eval_expr_str(self, expr_str: str) -> int:
-        """Evaluate a string expression to an integer."""
-        expr_str = expr_str.strip()
-        
-        # Handle simple cases first
-        try:
-            return int(expr_str)
-        except ValueError:
-            pass
-        
-        # Handle variable references
-        if expr_str in self.env:
-            value = self.env[expr_str]
-            if isinstance(value, (int, float)):
-                return int(value)
-        
-        # Parse and evaluate simple expressions using AST
-        try:
-            # Create an AST node from the expression string
-            node = ast.parse(expr_str, mode='eval').body
-            return int(self._eval_expr(node))
-        except (ValueError, SyntaxError, TypeError):
-            pass
-        
-        # Default to 0 if we can't evaluate
-        print(f"[qsm:warning] Could not evaluate expression '{expr_str}', defaulting to 0")
-        return 0
+    def _measurement_env(self):
+        if self.has_measurements and "result" not in self.variables:
+            raise RuntimeError("Run the simulation before printing measurements")
+        sample = self.variables.get("result", dict.fromkeys(range(self.qc.num_clbits), 0))
+        values = {"result": sample}
+        for name, index in self.cbit_map.items():
+            if "[" in name:
+                base, offset = name[:-1].split("[")
+                # A declared result register has its own indices, like every other register.
+                if base not in values or base == "result" and values[base] is sample:
+                    values[base] = {}
+                values[base][int(offset)] = sample[index]
+            else:
+                values[name] = sample[index]
+        return values
 
-    # --------------------------------------------------------------------- #
-    # Stubs                                                                 #
-    # --------------------------------------------------------------------- #
-    def _teleport_stub(self, q1: str, q2: str, q3: str) -> None:
-        """Implement quantum teleportation protocol."""
-        # Standard quantum teleportation protocol
-        # Assumes q1 is the qubit to teleport, q2 and q3 are ancilla qubits
-        
-        # Create Bell pair between q2 and q3
-        self.qc.h(self._q(q2))
-        self.qc.cx(self._q(q2), self._q(q3))
-        
-        # Bell measurement on q1 and q2
-        self.qc.cx(self._q(q1), self._q(q2))
-        self.qc.h(self._q(q1))
-        
-        # Measure q1 and q2 (would need classical bits for real implementation)
-        # For now, just apply the correction operations
-        self.qc.cx(self._q(q2), self._q(q3))
-        self.qc.cz(self._q(q1), self._q(q3))
-        
-        print(f"[qsm] Quantum teleportation applied: {q1} -> {q3} via {q2}")
+    @staticmethod
+    def _format_value(value):
+        if isinstance(value, dict):
+            bitstring = "".join(str(value[i]) for i in sorted(value, reverse=True))
+            return "{} ({})".format(bitstring, int(bitstring, 2)) if bitstring else ""
+        return str(value)
+
+    def execute_deferred_prints(self):
+        measurements = self._measurement_env()
+        for args, captured in self.deferred_prints:
+            env = dict(captured, **measurements)
+            print("[qsm]", " ".join(self._format_value(self._eval_expr(arg, env)) for arg in args))
+
+
+# Conventional spelling for new callers; retain the original public API.
+QsmCompiler = qsmCompiler

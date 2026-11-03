@@ -1,26 +1,14 @@
-
--- Quantum Teleportation Example
-qbit alice
-qbit bob
-qbit aux
-creg result[2]
-
--- Prepare state to teleport (|+⟩)
-hadamard alice
-
--- Create Bell pair between aux and bob
-hadamard aux
+-- Teleport |+> from Alice to Bob using measurement feedback.
+qbit alice, bob, aux
+creg result[3]
+h alice
+h aux
 cx aux, bob
-
--- Alice entangles her qubit with aux
 cx alice, aux
-hadamard alice
-
--- Measure Alice's qubits
+h alice
 measure alice -> result[0]
 measure aux -> result[1]
 
--- Bob applies corrections based on Alice's results
 if result[1] == 1 then
     x bob
 end
@@ -28,6 +16,8 @@ if result[0] == 1 then
     z bob
 end
 
--- Measure Bob's qubit (should match original state)
-measure bob
-print "Teleportation result: ", result
+-- Verify in the X basis: a successfully teleported |+> always yields zero.
+h bob
+measure bob -> result[2]
+print "Bob verification bit (expected 0):", result[2]
+print "Alice's measurements and Bob's verification:", result

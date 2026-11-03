@@ -1,0 +1,52 @@
+{
+  "Quantum program": {
+    "prefix": "qsm",
+    "body": ["qbit q[${1:2}]", "creg answer[${1:2}]", "", "$0", "", "measure q -> answer", "print \"Result:\", answer"],
+    "description": "Quantum program with register measurement"
+  },
+  "Bell pair": {
+    "prefix": "bell",
+    "body": ["h ${1:q[0]}", "cx ${1:q[0]}, ${2:q[1]}"],
+    "description": "Prepare a Bell pair"
+  },
+  "Numeric loop": {
+    "prefix": "for",
+    "body": ["for ${1:i} = ${2:0}, ${3:n-1} do", "    $0", "end"],
+    "description": "Inclusive numeric loop"
+  },
+  "While loop": {
+    "prefix": "while",
+    "body": ["while ${1:condition} do", "    $0", "end"],
+    "description": "Compile-time while loop"
+  },
+  "Conditional": {
+    "prefix": "if",
+    "body": ["if ${1:condition} then", "    $0", "end"],
+    "description": "Classical conditional"
+  },
+  "Conditional with else": {
+    "prefix": "ifelse",
+    "body": ["if ${1:condition} then", "    ${2}", "else", "    $0", "end"],
+    "description": "Conditional with alternate branch"
+  },
+  "Function": {
+    "prefix": "function",
+    "body": ["function ${1:name}(${2:args})", "    $0", "end"],
+    "description": "User-defined function"
+  },
+  "Controlled phase": {
+    "prefix": "cp",
+    "body": ["cp(${1:pi/2}) ${2:q[0]}, ${3:q[1]}"],
+    "description": "Controlled phase rotation in radians"
+  },
+  "Multi-controlled Z": {
+    "prefix": "mcz",
+    "body": ["mcz ${1:q}[${2:0}..${3:n-2}], ${1:q}[${4:n-1}]"],
+    "description": "Multi-controlled phase flip"
+  },
+  "Measurement feedback": {
+    "prefix": "feedback",
+    "body": ["measure ${1:q[0]} -> ${2:answer[0]}", "if ${2:answer[0]} == 1 then", "    x ${3:q[1]}", "end"],
+    "description": "Conditional gate based on a measurement"
+  }
+}

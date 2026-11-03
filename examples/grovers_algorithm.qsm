@@ -1,41 +1,31 @@
+-- Grover search for |1010>, with three amplification iterations.
 qbit q[4]
 creg answer[4]
 
--- Create uniform superposition
-for i = 0, 3 do
-    hadamard q[i]
-end
-
--- Oracle marks |1010>
 function oracle()
-    for i = 0, 3 do
-        if i % 2 == 0 then
-            z q[i]
-        end
-    end
+    -- Convert |1010> to |1111>, flip its phase, then undo the conversion.
+    x q[0], q[2]
+    mcz q[0..2], q[3]
+    x q[0], q[2]
 end
 
 function diffusion(n)
     for i = 0, n-1 do
-        hadamard q[i]
+        h q[i]
         x q[i]
     end
-    h q[n-1]
     mcz q[0..n-2], q[n-1]
-    h q[n-1]
     for i = 0, n-1 do
         x q[i]
-        hadamard q[i]
+        h q[i]
     end
 end
 
-diffusion(4)
-oracle()
-diffusion(4)
+h q
+for iteration = 1, 3 do
+    oracle()
+    diffusion(4)
+end
 
-measure q[0] -> answer[0]
-measure q[1] -> answer[1]
-measure q[2] -> answer[2]
-measure q[3] -> answer[3]
-
-print "Grover output: ", answer
+measure q -> answer
+print "Grover output:", answer

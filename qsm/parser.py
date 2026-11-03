@@ -1,529 +1,380 @@
-# qsm/parser.py
-"""
-A parser for qsm language supporting Lua-like syntax and quantum extensions.
-"""
+"""Line-oriented parser for the Lua-inspired QSM language."""
 
 import ast
+import keyword
+import re
 
-# qsm quantum instruction AST nodes
-class QBitDecl(ast.AST):         # qbit a, b, c
+
+class QBitDecl(ast.AST):
     _fields = ("targets",)
 
-class Hadamard(ast.AST):         # hadamard a
+
+class CRegDecl(ast.AST):
+    _fields = ("targets",)
+
+
+class Hadamard(ast.AST):
     _fields = ("target",)
 
-class CX(ast.AST):               # cx a, b
+
+class XGate(Hadamard):
+    pass
+
+
+class YGate(Hadamard):
+    pass
+
+
+class ZGate(Hadamard):
+    pass
+
+
+class SGate(Hadamard):
+    pass
+
+
+class TGate(Hadamard):
+    pass
+
+
+class CX(ast.AST):
     _fields = ("ctrl", "targ")
 
-class Measure(ast.AST):          # measure a -> b
-    _fields = ("target", "classical_target")
 
-class Teleport(ast.AST):         # teleport a, b, c
-    _fields = ("q1", "q2", "q3")
-
-class XGate(ast.AST):            # x a
-    _fields = ("target",)
-
-class ZGate(ast.AST):            # z a
-    _fields = ("target",)
-
-class YGate(ast.AST):            # y a
-    _fields = ("target",)
-
-class SGate(ast.AST):            # s a
-    _fields = ("target",)
-
-class TGate(ast.AST):            # t a
-    _fields = ("target",)
-
-class SwapGate(ast.AST):         # swap a, b
+class SwapGate(ast.AST):
     _fields = ("q1", "q2")
 
-class MCZGate(ast.AST):          # mcz controls, target
+
+class MCZGate(ast.AST):
     _fields = ("controls", "target")
+
+
+class Measure(ast.AST):
+    _fields = ("target", "classical_target")
+
+
+class Teleport(ast.AST):
+    _fields = ("q1", "q2", "q3")
+
+
+class Gate(ast.AST):
+    _fields = ("name", "params", "targets")
+
 
 class FunctionDef(ast.AST):
     _fields = ("name", "args", "body")
 
+
 class FunctionCall(ast.AST):
     _fields = ("name", "args")
 
-class CRegDecl(ast.AST):         # creg answer[4]
-    _fields = ("targets",)
 
-class QSMFor(ast.AST):           # for loop with quantum operations
-    _fields = ("target", "iter", "body")
+# name: (number of angle parameters, number of qubits); None permits many qubits.
+GATES = {
+    **{name: (0, None) for name in
+       ("h", "hadamard", "x", "y", "z", "s", "sdg", "t", "tdg",
+        "sx", "sxdg", "id", "reset", "barrier")},
+    **{name: (0, 2) for name in ("cx", "cy", "cz", "ch", "swap")},
+    **{name: (0, 3) for name in ("ccx", "cswap", "teleport")},
+    **{name: (1, None) for name in ("rx", "ry", "rz", "p")},
+    "u": (3, None),
+    **{name: (1, 2) for name in
+       ("cp", "crx", "cry", "crz", "rxx", "ryy", "rzz")},
+    "mcx": (0, None), "mcz": (0, None),
+}
 
-class QSMWhile(ast.AST):         # while loop with quantum operations
-    _fields = ("test", "body")
+_KEYWORDS = set("qbit creg if then elseif else end for while do function return print true false nil and or not".split())
 
-class QSMIf(ast.AST):            # if statement with quantum operations
-    _fields = ("test", "body", "orelse")
+
+def _identifier(name):
+    if not re.fullmatch(r"[A-Za-z_]\w*", name) or keyword.iskeyword(name) or name in _KEYWORDS:
+        raise SyntaxError("Invalid or reserved identifier '{}'".format(name))
+    return name
+
+_EXPR_TOKENS = re.compile(
+    r'''("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|\b(true|false|nil)\b|(~=|\^)'''
+)
+
+
+def parse_expression(source):
+    """Translate Lua literals/operators outside strings, preserving precedence."""
+    replacements = {"true": "True", "false": "False", "nil": "None",
+                    "~=": "!=", "^": "**"}
+    translated = _EXPR_TOKENS.sub(
+        lambda m: m[1] if m[1] is not None else replacements[m[2] or m[3]],
+        source.strip(),
+    )
+    return ast.parse(translated, mode="eval").body
+
+
+def split_arguments(source):
+    """Split commas outside quotes, parentheses and register indices."""
+    parts, stack, start, quote, escaped = [], [], 0, None, False
+    for i, char in enumerate(source):
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif char in "\"'":
+            quote = char
+        elif char in "([":
+            stack.append(char)
+        elif char in ")]":
+            if not stack or stack.pop() != {")": "(", "]": "["}[char]:
+                raise SyntaxError("Unmatched bracket")
+        elif char == "," and not stack:
+            parts.append(source[start:i].strip())
+            start = i + 1
+    if quote or stack:
+        raise SyntaxError("Unterminated string or bracket")
+    parts.append(source[start:].strip())
+    if any(not part for part in parts):
+        raise SyntaxError("Expected an argument")
+    return parts
+
+
+def _strip_comments(source):
+    """Keep strings and line numbers intact while removing both comment forms."""
+    output, i, quote = [], 0, None
+    while i < len(source):
+        char = source[i]
+        if quote:
+            output.append(char)
+            if char == "\\" and i + 1 < len(source):
+                i += 1
+                output.append(source[i])
+            elif char == quote:
+                quote = None
+        elif char in "\"'":
+            quote = char
+            output.append(char)
+        elif source.startswith("--[[", i):
+            end = source.find("]]", i + 4)
+            if end < 0:
+                raise SyntaxError("Unterminated multiline comment",
+                                  ("<qsm>", source.count("\n", 0, i) + 1, 1, None))
+            end += 2
+            if source.startswith("--", end):
+                end += 2
+            output.extend("\n" if c == "\n" else " " for c in source[i:end])
+            i = end
+            continue
+        elif source.startswith("--", i):
+            end = source.find("\n", i)
+            i = len(source) if end < 0 else end
+            continue
+        else:
+            output.append(char)
+        i += 1
+    return "".join(output)
+
 
 class qsmParser:
-    def parse(self, code: str):
-        """Parse Lua-like qsm code into mixed AST nodes, with multiline comment support."""
-        import re
-        # Remove multiline comments: --[[ ... ]]
-        code = re.sub(r'--\[\[.*?\]\]--', '', code, flags=re.DOTALL)
-        lines = code.strip().splitlines()
-        ast_nodes = []
-        i = 0
-        
-        while i < len(lines):
-            line = lines[i]
-            # Remove single-line comments (everything after --)
-            code_part = line.split('--', 1)[0]
-            stripped = code_part.strip()
-            
-            # Skip empty or comment-only lines
-            if not stripped:
-                i += 1
+    def parse(self, code, filename="<qsm>"):
+        self.filename = filename
+        self.original_lines = code.splitlines()
+        try:
+            self.lines = _strip_comments(code).splitlines()
+        except SyntaxError as exc:
+            exc.filename = filename
+            raise
+        self.pos = 0
+        return self._block()
+
+    def _error(self, message, line=None):
+        line = self.pos + 1 if line is None else line
+        text = self.original_lines[line - 1] if line <= len(self.original_lines) else ""
+        return SyntaxError(message, (self.filename, line, 1, text))
+
+    def _block(self, terminators=()):
+        nodes = []
+        while self.pos < len(self.lines):
+            source = self.lines[self.pos].strip()
+            if source == "end" or source == "else" or source.startswith("elseif "):
+                if source.split()[0] in terminators:
+                    return nodes
+                raise self._error("Unexpected '{}'".format(source))
+            if not source:
+                self.pos += 1
                 continue
-                
-            # Parse the line and add to AST
-            node = self._parse_line(stripped, lines, i)
-            if node is not None:
-                if isinstance(node, tuple):
-                    # Node with new position
-                    ast_nodes.append(node[0])
-                    i = node[1]
-                else:
-                    ast_nodes.append(node)
-                    i += 1
-            else:
-                i += 1
-        return ast_nodes
-    
-    def _parse_line(self, stripped: str, lines: list, current_pos: int):
-        """Parse a single line and return the corresponding AST node."""
-        
-        # Function definition
-        if stripped.startswith('function '):
-            return self._parse_function(stripped, lines, current_pos)
-            
-        # Function call
-        if '(' in stripped and stripped.endswith(')') and not stripped.startswith('if ') and not stripped.startswith('print '):
-            fname, argstr = stripped.split('(', 1)
-            fname = fname.strip()
-            argstr = argstr.rstrip(')').strip()
-            args = [a.strip() for a in argstr.split(',')] if argstr else []
-            return FunctionCall(name=fname, args=args)
-            
-        # Control flow structures
-        if stripped.startswith('for ') and ' = ' in stripped and stripped.endswith(' do'):
-            return self._parse_for_loop(stripped, lines, current_pos)
-            
-        if stripped.startswith('while ') and stripped.endswith(' do'):
-            return self._parse_while_loop(stripped, lines, current_pos)
-            
-        if stripped.startswith('if ') and stripped.endswith(' then'):
-            return self._parse_if_statement(stripped, lines, current_pos)
-            
-        # Quantum register declarations
-        if stripped.startswith('qbit '):
-            names = [n.strip() for n in stripped[5:].split(',')]
-            expanded = []
-            for name in names:
-                if '[' in name and name.endswith(']'):
-                    base, count = name[:-1].split('[')
-                    count = int(count)
-                    expanded.extend([f"{base}[{i}]" for i in range(count)])
-                else:
-                    expanded.append(name)
-            return QBitDecl(targets=expanded)
-            
-        if stripped.startswith('creg '):
-            names = [n.strip() for n in stripped[5:].split(',')]
-            expanded = []
-            for name in names:
-                if '[' in name and name.endswith(']'):
-                    base, count = name[:-1].split('[')
-                    count = int(count)
-                    expanded.extend([f"{base}[{i}]" for i in range(count)])
-                else:
-                    expanded.append(name)
-            return CRegDecl(targets=expanded)
-            
-        # Quantum gates
-        if stripped.startswith('hadamard ') or stripped.startswith('h '):
-            prefix_len = 9 if stripped.startswith('hadamard ') else 2
-            names = [n.strip() for n in stripped[prefix_len:].split(',')]
-            # Return multiple gates for multiple targets
-            gates = []
-            for name in names:
-                if name:
-                    gates.append(Hadamard(target=name))
-            return gates[0] if len(gates) == 1 else gates
-            
-        if stripped.startswith('x '):
-            names = [n.strip() for n in stripped[2:].split(',')]
-            gates = []
-            for name in names:
-                if name:
-                    gates.append(XGate(target=name))
-            return gates[0] if len(gates) == 1 else gates
-            
-        if stripped.startswith('z '):
-            names = [n.strip() for n in stripped[2:].split(',')]
-            gates = []
-            for name in names:
-                if name:
-                    gates.append(ZGate(target=name))
-            return gates[0] if len(gates) == 1 else gates
-            
-        if stripped.startswith('y '):
-            names = [n.strip() for n in stripped[2:].split(',')]
-            gates = []
-            for name in names:
-                if name:
-                    gates.append(YGate(target=name))
-            return gates[0] if len(gates) == 1 else gates
-            
-        if stripped.startswith('s '):
-            names = [n.strip() for n in stripped[2:].split(',')]
-            gates = []
-            for name in names:
-                if name:
-                    gates.append(SGate(target=name))
-            return gates[0] if len(gates) == 1 else gates
-            
-        if stripped.startswith('t '):
-            names = [n.strip() for n in stripped[2:].split(',')]
-            gates = []
-            for name in names:
-                if name:
-                    gates.append(TGate(target=name))
-            return gates[0] if len(gates) == 1 else gates
-            
-        if stripped.startswith('swap '):
-            args = [n.strip() for n in stripped[5:].split(',')]
-            if len(args) == 2:
-                return SwapGate(q1=args[0], q2=args[1])
-                
-        if stripped.startswith('cx '):
-            args = [n.strip() for n in stripped[3:].split(',')]
-            if len(args) == 2:
-                return CX(ctrl=args[0], targ=args[1])
-                
-        if stripped.startswith('measure '):
-            measure_part = stripped[8:]
-            if '->' in measure_part:
-                qubit_part, classical_part = measure_part.split('->', 1)
-                qubit_target = qubit_part.strip()
-                classical_target = classical_part.strip()
-                return Measure(target=qubit_target, classical_target=classical_target)
-            else:
-                names = [n.strip() for n in measure_part.split(',')]
-                gates = []
-                for name in names:
-                    if name:
-                        gates.append(Measure(target=name, classical_target=None))
-                return gates[0] if len(gates) == 1 else gates
-                
-        if stripped.startswith('mcz '):
-            # Multi-controlled Z gate: mcz q[0..n-2], q[n-1]
-            args = [n.strip() for n in stripped[4:].split(',')]
-            if len(args) == 2:
-                controls = args[0]
-                target = args[1]
-                return MCZGate(controls=controls, target=target)
-                
-        if stripped.startswith('teleport '):
-            args = [n.strip() for n in stripped[9:].split(',')]
-            if len(args) == 3:
-                return Teleport(q1=args[0], q2=args[1], q3=args[2])
-                
-        if stripped.startswith('print '):
-            args_str = stripped[6:].strip()
-            arg_strings = [a.strip() for a in args_str.split(',')]
-            args = []
-            for tok in arg_strings:
-                # String literal with quotes?
-                if (tok.startswith('"') and tok.endswith('"')) or \
-                   (tok.startswith("'") and tok.endswith("'")):
-                    args.append(ast.Constant(value=tok[1:-1]))
-                    continue
+            lineno = self.pos + 1
+            self.pos += 1
+            try:
+                node = self._statement(source)
+            except (SyntaxError, ValueError) as exc:
+                if isinstance(exc, SyntaxError) and exc.filename == self.filename:
+                    raise
+                raise self._error(getattr(exc, "msg", str(exc)), lineno) from None
+            for item in node if isinstance(node, list) else [node]:
+                item.lineno = lineno
+                item.col_offset = 0
+                nodes.append(item)
+        if terminators:
+            raise self._error("Missing 'end' for block", len(self.lines) or 1)
+        return nodes
 
-                # Register slice, e.g. result[1] or answer[i]
-                if '[' in tok and tok.endswith(']'):
-                    base, idx = tok[:-1].split('[', 1)
-                    # Try to parse idx as int, else as variable
-                    try:
-                        idx_ast = ast.Constant(value=int(idx))
-                    except ValueError:
-                        idx_ast = ast.Name(id=idx, ctx=ast.Load())
-                    args.append(
-                        ast.Subscript(
-                            value=ast.Name(id=base, ctx=ast.Load()),
-                            slice=idx_ast,
-                            ctx=ast.Load()
-                        )
-                    )
-                    continue
+    def _end(self):
+        if self.pos >= len(self.lines) or self.lines[self.pos].strip() != "end":
+            raise self._error("Expected 'end'")
+        self.pos += 1
 
-                # Bare register name
-                if tok.isidentifier():
-                    args.append(ast.Name(id=tok, ctx=ast.Load()))
-                    continue
-
-                # Numeric literal
-                try:
-                    args.append(ast.Constant(value=int(tok)))
-                except ValueError:
-                    args.append(ast.Constant(value=tok))
-
-            return ast.Expr(
-                value=ast.Call(
-                    func=ast.Name(id='print', ctx=ast.Load()),
-                    args=args,
-                    keywords=[]
-                )
-            )
-
-            
-        # Skip 'end' statements - they're handled by the control flow parsers
-        if stripped == 'end':
-            return None
-            
-        # Other statements - try to parse as Python
-        try:
-            node = ast.parse(stripped, mode='eval').body
-            # If it's a bare identifier (ast.Name), skip it
-            if isinstance(node, ast.Name):
-                return None
-            return node
-        except:
-            # If it fails, create a simple assignment or expression
-            if '=' in stripped:
-                var, val = stripped.split('=', 1)
-                return ast.Assign(
-                    targets=[ast.Name(id=var.strip(), ctx=ast.Store())],
-                    value=ast.Constant(value=val.strip())
-                )
-        return None
-    
-    def _parse_expr(self, expr_str: str) -> ast.expr:
-        """Parse an expression string into an AST node."""
-        expr_str = expr_str.strip()
-        
-        # Try to parse as integer first
-        try:
-            return ast.Constant(value=int(expr_str))
-        except ValueError:
-            pass
-        
-        # Handle simple binary operations
-        if '+' in expr_str:
-            parts = expr_str.split('+', 1)
-            left = self._parse_expr(parts[0].strip())
-            right = self._parse_expr(parts[1].strip())
-            return ast.BinOp(left=left, op=ast.Add(), right=right)
-        elif '-' in expr_str:
-            parts = expr_str.split('-', 1)
-            left = self._parse_expr(parts[0].strip())
-            right = self._parse_expr(parts[1].strip())
-            return ast.BinOp(left=left, op=ast.Sub(), right=right)
-        elif '*' in expr_str:
-            parts = expr_str.split('*', 1)
-            left = self._parse_expr(parts[0].strip())
-            right = self._parse_expr(parts[1].strip())
-            return ast.BinOp(left=left, op=ast.Mult(), right=right)
-        elif '/' in expr_str:
-            parts = expr_str.split('/', 1)
-            left = self._parse_expr(parts[0].strip())
-            right = self._parse_expr(parts[1].strip())
-            return ast.BinOp(left=left, op=ast.Div(), right=right)
-        
-        # Handle variable names
-        return ast.Name(id=expr_str, ctx=ast.Load())
-    
-    def _parse_function(self, stripped: str, lines: list, current_pos: int):
-        """Parse a function definition."""
-        header = stripped[len('function '):]
-        name, argstr = header.split('(', 1)
-        name = name.strip()
-        argstr = argstr.rstrip(')').strip()
-        args = [a.strip() for a in argstr.split(',')] if argstr else []
-        
-        # Parse function body until 'end'
-        body_nodes = []
-        i = current_pos + 1
-        while i < len(lines):
-            body_line = lines[i]
-            if body_line.strip() == 'end':
-                break
-            
-            code_part = body_line.split('--', 1)[0]
-            stripped_body = code_part.strip()
-            if stripped_body:
-                node = self._parse_line(stripped_body, lines, i)
-                if node is not None:
-                    if isinstance(node, tuple):
-                        body_nodes.append(node[0])
-                        i = node[1]
-                    else:
-                        body_nodes.append(node)
-            i += 1
-            
-        return (FunctionDef(name=name, args=args, body=body_nodes), i)
-    
-    def _parse_for_loop(self, stripped: str, lines: list, current_pos: int):
-        """Parse a for loop."""
-        for_head = stripped[4:-3]  # Remove 'for ' and ' do'
-        var, rng = for_head.split('=', 1)
-        var = var.strip()
-        rng = rng.strip()
-        
-        # Create range AST
-        if ',' in rng:
-            parts = [p.strip() for p in rng.split(',')]
-            if len(parts) == 2:
-                start, stop = parts
-                start_node = self._parse_expr(start)
-                stop_node = self._parse_expr(stop)
-                # Add 1 to stop for inclusive range
-                stop_plus_one = ast.BinOp(
-                    left=stop_node,
-                    op=ast.Add(),
-                    right=ast.Constant(value=1)
-                )
-                iter_node = ast.Call(
-                    func=ast.Name(id='range', ctx=ast.Load()),
-                    args=[start_node, stop_plus_one],
-                    keywords=[]
-                )
-            elif len(parts) == 3:
-                start, stop, step = parts
-                start_node = self._parse_expr(start)
-                stop_node = self._parse_expr(stop)
-                step_node = self._parse_expr(step)
-                # Add 1 to stop for inclusive range
-                stop_plus_one = ast.BinOp(
-                    left=stop_node,
-                    op=ast.Add(),
-                    right=ast.Constant(value=1)
-                )
-                iter_node = ast.Call(
-                    func=ast.Name(id='range', ctx=ast.Load()),
-                    args=[start_node, stop_plus_one, step_node],
-                    keywords=[]
-                )
+    def _if(self, condition):
+        body = self._block(("else", "elseif", "end"))
+        tail = self.lines[self.pos].strip()
+        orelse = []
+        if tail.startswith("elseif "):
+            match = re.fullmatch(r"elseif\s+(.+)\s+then", tail)
+            if not match:
+                raise self._error("Expected 'elseif condition then'")
+            line = self.pos + 1
+            self.pos += 1
+            branch = self._if(parse_expression(match[1]))
+            branch.lineno = line
+            orelse = [branch]
         else:
-            rng_node = self._parse_expr(rng)
-            iter_node = ast.Call(
-                func=ast.Name(id='range', ctx=ast.Load()),
-                args=[rng_node],
-                keywords=[]
-            )
-            
-        # Parse loop body until 'end'
-        body_nodes = []
-        i = current_pos + 1
-        while i < len(lines):
-            body_line = lines[i]
-            if body_line.strip() == 'end':
-                break
-                
-            code_part = body_line.split('--', 1)[0]
-            stripped_body = code_part.strip()
-            if stripped_body:
-                node = self._parse_line(stripped_body, lines, i)
-                if node is not None:
-                    if isinstance(node, tuple):
-                        body_nodes.append(node[0])
-                        i = node[1]
-                    else:
-                        body_nodes.append(node)
-            i += 1
-            
-        # Create Python for loop AST
-        for_node = ast.For(
-            target=ast.Name(id=var, ctx=ast.Store()),
-            iter=iter_node,
-            body=body_nodes,
-            orelse=[]
-        )
-        
-        return (for_node, i)
-    
-    def _parse_while_loop(self, stripped: str, lines: list, current_pos: int):
-        """Parse a while loop."""
-        condition = stripped[6:-3]  # Remove 'while ' and ' do'
-        
-        # Parse condition
-        test_node = ast.parse(condition, mode='eval').body
-        
-        # Parse loop body until 'end'
-        body_nodes = []
-        i = current_pos + 1
-        while i < len(lines):
-            body_line = lines[i]
-            if body_line.strip() == 'end':
-                break
-                
-            code_part = body_line.split('--', 1)[0]
-            stripped_body = code_part.strip()
-            if stripped_body:
-                node = self._parse_line(stripped_body, lines, i)
-                if node is not None:
-                    if isinstance(node, tuple):
-                        body_nodes.append(node[0])
-                        i = node[1]
-                    else:
-                        body_nodes.append(node)
-            i += 1
-            
-        while_node = ast.While(
-            test=test_node,
-            body=body_nodes,
-            orelse=[]
-        )
-        
-        return (while_node, i)
-    
-    def _parse_if_statement(self, stripped: str, lines: list, current_pos: int):
-        """Parse an if statement."""
-        condition = stripped[3:-5]  # Remove 'if ' and ' then'
-        
-        # Parse condition
-        test_node = ast.parse(condition, mode='eval').body
-        
-        # Parse if body until 'else' or 'end'
-        body_nodes = []
-        orelse_nodes = []
-        i = current_pos + 1
-        in_else = False
-        
-        while i < len(lines):
-            body_line = lines[i]
-            stripped_body = body_line.strip()
-            
-            if stripped_body == 'end':
-                break
-            elif stripped_body == 'else':
-                in_else = True
-                i += 1
-                continue
-                
-            code_part = body_line.split('--', 1)[0]
-            stripped_body = code_part.strip()
-            if stripped_body:
-                node = self._parse_line(stripped_body, lines, i)
-                if node is not None:
-                    if isinstance(node, tuple):
-                        target_list = orelse_nodes if in_else else body_nodes
-                        target_list.append(node[0])
-                        i = node[1]
-                    else:
-                        target_list = orelse_nodes if in_else else body_nodes
-                        target_list.append(node)
-            i += 1
-            
-        if_node = ast.If(
-            test=test_node,
-            body=body_nodes,
-            orelse=orelse_nodes
-        )
-        
-        return (if_node, i)
+            if tail == "else":
+                self.pos += 1
+                orelse = self._block(("end",))
+            self._end()
+        return ast.If(test=condition, body=body, orelse=orelse)
+
+    def _statement(self, source):
+        match = re.fullmatch(r"function\s+([A-Za-z_]\w*)\s*\((.*)\)", source)
+        if match:
+            _identifier(match[1])
+            args = split_arguments(match[2]) if match[2].strip() else []
+            for arg in args:
+                _identifier(arg)
+            if len(set(args)) != len(args):
+                raise SyntaxError("Duplicate function parameter")
+            body = self._block(("end",))
+            self._end()
+            return FunctionDef(name=match[1], args=args, body=body)
+        match = re.fullmatch(r"for\s+([A-Za-z_]\w*)\s*=\s*(.+)\s+do", source)
+        if match:
+            _identifier(match[1])
+            bounds = split_arguments(match[2])
+            if len(bounds) not in (2, 3):
+                raise SyntaxError("Expected 'for name = start, stop[, step] do'")
+            iterator = ast.Call(func=ast.Name(id="inclusive_range", ctx=ast.Load()),
+                                args=[parse_expression(b) for b in bounds], keywords=[])
+            body = self._block(("end",))
+            self._end()
+            return ast.For(target=ast.Name(id=match[1], ctx=ast.Store()),
+                           iter=iterator, body=body, orelse=[])
+        match = re.fullmatch(r"while\s+(.+)\s+do", source)
+        if match:
+            test = parse_expression(match[1])
+            body = self._block(("end",))
+            self._end()
+            return ast.While(test=test, body=body, orelse=[])
+        match = re.fullmatch(r"if\s+(.+)\s+then", source)
+        if match:
+            return self._if(parse_expression(match[1]))
+        match = re.fullmatch(r"(qbit|creg)\s+(.+)", source)
+        if match:
+            targets = []
+            for name in split_arguments(match[2]):
+                decl = re.fullmatch(r"([A-Za-z_]\w*)(?:\[\s*([0-9]+)\s*\])?", name)
+                if not decl:
+                    raise SyntaxError("Expected a register name or name[positive integer]")
+                _identifier(decl[1])
+                if decl[2] is None:
+                    targets.append(decl[1])
+                else:
+                    size = int(decl[2])
+                    if not 1 <= size <= 128:
+                        raise SyntaxError("Register size must be between 1 and 128")
+                    targets.extend("{}[{}]".format(decl[1], i) for i in range(size))
+            return (QBitDecl if match[1] == "qbit" else CRegDecl)(targets=targets)
+        if source.startswith("measure "):
+            parts = source[8:].split("->")
+            if len(parts) > 2:
+                raise SyntaxError("Expected 'measure qubits [-> classical bits]'")
+            targets = split_arguments(parts[0])
+            if len(parts) == 2:
+                classical = split_arguments(parts[1])
+                if len(classical) != len(targets):
+                    raise SyntaxError("Measurement source and destination counts differ")
+            else:
+                classical = [None] * len(targets)
+            return [Measure(target=q, classical_target=c) for q, c in zip(targets, classical)]
+        if source == "print" or source.startswith("print ") or source.startswith("print("):
+            text = source[5:].strip()
+            if text.startswith("("):
+                call = parse_expression("print" + text)
+                if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                        and call.func.id == "print" and not call.keywords):
+                    raise SyntaxError("Expected 'print(expressions)' without keyword arguments")
+            else:
+                call = ast.Call(func=ast.Name(id="print", ctx=ast.Load()),
+                                args=[parse_expression(p) for p in split_arguments(text)] if text else [],
+                                keywords=[])
+            return ast.Expr(value=call)
+        if source == "return" or source.startswith("return "):
+            return ast.Return(value=parse_expression(source[7:]) if source != "return" else None)
+
+        # A gate's parameter list may itself contain nested function calls.
+        head = re.match(r"([A-Za-z_]\w*)", source)
+        if head and head[1] in GATES and not source[head.end():].lstrip().startswith("="):
+            name, rest = head[1], source[head.end():].strip()
+            params = []
+            if rest.startswith("("):
+                depth, quote, escaped, end = 0, None, False, None
+                for i, char in enumerate(rest):
+                    if quote:
+                        if escaped:
+                            escaped = False
+                        elif char == "\\":
+                            escaped = True
+                        elif char == quote:
+                            quote = None
+                    elif char in "\"'":
+                        quote = char
+                    elif char == "(":
+                        depth += 1
+                    elif char == ")":
+                        depth -= 1
+                        if depth == 0:
+                            end = i
+                            break
+                if end is None:
+                    raise SyntaxError("Unterminated gate parameters")
+                params = [parse_expression(p) for p in split_arguments(rest[1:end])]
+                rest = rest[end + 1:].strip()
+            targets = split_arguments(rest) if rest else []
+            param_count, target_count = GATES[name]
+            if len(params) != param_count:
+                raise SyntaxError("Gate '{}' requires {} angle parameter(s)".format(name, param_count))
+            if target_count is not None and len(targets) != target_count:
+                raise SyntaxError("Gate '{}' requires {} qubits".format(name, target_count))
+            if not targets and name != "barrier":
+                raise SyntaxError("Gate '{}' requires qubit targets".format(name))
+            if name in ("mcx", "mcz") and len(targets) < 2:
+                raise SyntaxError("Expected controls followed by a target")
+            legacy_single = {"h": Hadamard, "hadamard": Hadamard, "x": XGate,
+                             "y": YGate, "z": ZGate, "s": SGate, "t": TGate}
+            if name in legacy_single:
+                return [legacy_single[name](target=t) for t in targets]
+            if name == "cx":
+                return CX(ctrl=targets[0], targ=targets[1])
+            if name == "swap":
+                return SwapGate(q1=targets[0], q2=targets[1])
+            if name == "teleport":
+                return Teleport(q1=targets[0], q2=targets[1], q3=targets[2])
+            if name == "mcz":
+                return MCZGate(controls=", ".join(targets[:-1]), target=targets[-1])
+            return Gate(name=name, params=params, targets=targets)
+        # Python supplies syntax trees only; the compiler never executes Python code.
+        assignment = re.fullmatch(r"([A-Za-z_]\w*)\s*=\s*(?!=)(.+)", source)
+        if assignment:
+            _identifier(assignment[1])
+            return ast.Assign(targets=[ast.Name(id=assignment[1], ctx=ast.Store())],
+                              value=parse_expression(assignment[2]))
+        expression = parse_expression(source)
+        if isinstance(expression, ast.Call) and isinstance(expression.func, ast.Name) and not expression.keywords:
+            return FunctionCall(name=expression.func.id, args=expression.args)
+        raise SyntaxError("Unknown or unsupported statement")

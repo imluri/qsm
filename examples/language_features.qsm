@@ -1,0 +1,27 @@
+-- Expressions, qubit arguments, descending loops and parameterized gates.
+qbit q[3]
+creg answer[3]
+
+function rotate(target, angle)
+    ry(angle) target
+end
+
+function double(value)
+    return value * 2
+end
+
+angle = pi / double(1)
+for i = 2, 0, -1 do
+    if i == 0 then
+        rotate(q[i], pi)
+    elseif i == 1 then
+        rx(double(angle)) q[i]
+    else
+        h q[i]
+        h q[i]
+    end
+end
+
+measure q -> answer
+print "Language features (expected 011):", answer
+print "Comments inside strings are preserved: -- hello, QSM"

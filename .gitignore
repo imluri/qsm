@@ -65,6 +65,8 @@ Pipfile.lock
 
 # VS Code
 .vscode/
+!editors/vscode/.vscode/
+!editors/vscode/.vscode/launch.json
 
 # Environments
 .env
@@ -92,3 +94,7 @@ Desktop.ini
 
 # Egg info
 qsm.egg-info/
+
+# VS Code extension dependencies and packages
+node_modules/
+*.vsix
